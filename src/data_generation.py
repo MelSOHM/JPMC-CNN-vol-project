@@ -170,8 +170,10 @@ def time_split(df: pd.DataFrame,
 
 
 # ------------------------------------------------------
-# 6) Image generation - Heatmap
+# 6) Image generation
 # ------------------------------------------------------
+
+# Kind : Heatmap 
 
 def window_indices(n: int, win: int, step: int) -> List[Tuple[int, int]]:
     idx = []
@@ -211,6 +213,95 @@ def to_heatmap_image(window_df: pd.DataFrame,
     plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
     plt.close()
 
+# Kind: Time series
+
+def to_timeseries_image(
+    window_df: pd.DataFrame,
+    out_path: Path,
+    *,
+    kind: str = "vol",              # "vol" | "ohlc"
+    ma_window: int = 60,            # Moving-average window size
+    price_cols=("open","high","low","close"),
+    volume_col: str = "volume",
+    vol_col: str = "vol",           # Volatility column
+    fg: str = "white",
+    bg: str = "black",
+    width_px: int = 256,
+    height_px: int = 256,
+    dpi: int = 100,
+):
+    """
+    Generate a panel image (top: main series + moving average; bottom: bars).
+    - kind="ohlc": line-style candlesticks + MA(close); bars = volume if available.
+    - kind="vol" : volatility line + MA(vol); bars = volume if available, otherwise volatility bars.
+
+    Requirements:
+        * kind="ohlc": window_df must contain open, high, low, close (ideally also volume).
+        * kind="vol" : window_df must contain the `vol_col` column (and volume if desired).
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ---- Figure and axes (80% top / 20% bottom) ----
+    fig_h = height_px / dpi
+    fig_w = width_px / dpi
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+    gs = fig.add_gridspec(nrows=5, ncols=1, hspace=0.0)
+    ax_top = fig.add_subplot(gs[:-1, 0])                 # 4/5 height
+    ax_bot = fig.add_subplot(gs[-1, 0], sharex=ax_top)  # 1/5 height
+
+    fig.patch.set_facecolor(bg)
+    ax_top.set_facecolor(bg)
+    ax_bot.set_facecolor(bg)
+    for ax in (ax_top, ax_bot):
+        ax.axis("off")
+        ax.margins(x=0)
+
+    x = np.arange(len(window_df))
+
+    if kind == "ohlc":
+        o, h, l, c = [window_df[col].values.astype(float) for col in price_cols]
+        # y-limits with a small padding
+        ymin = np.nanmin(l); ymax = np.nanmax(h)
+        pad = 0.03 * (ymax - ymin if ymax > ymin else 1.0)
+        ax_top.set_ylim(ymin - pad, ymax + pad)
+
+        # --- line-style candlesticks (as in the sample paper) ---
+        ax_top.vlines(x, l, h, colors=fg, linewidth=1.0)
+        ax_top.hlines(o, x - 0.25, x,        colors=fg, linewidth=1.0)  # open tick on the left
+        ax_top.hlines(c, x,        x + 0.25, colors=fg, linewidth=1.0)  # close tick on the right
+
+        # Moving average on close
+        c_ma = pd.Series(c).rolling(ma_window, min_periods=1).mean().values
+        ax_top.plot(x, c_ma, color=fg, linewidth=1.4, alpha=0.85)
+
+        # Bars (volume if available)
+        bars = window_df[volume_col].values.astype(float) if volume_col in window_df else np.zeros_like(x)
+        ax_bot.bar(x, bars, color=fg, width=0.8)
+
+    else:  # kind == "vol"
+        v = window_df[vol_col].values.astype(float)
+        v_ma = pd.Series(v).rolling(ma_window, min_periods=1).mean().values
+
+        # y-limits with padding
+        ymin = np.nanmin(np.minimum(v, v_ma))
+        ymax = np.nanmax(np.maximum(v, v_ma))
+        pad = 0.05 * (ymax - ymin if ymax > ymin else 1.0)
+        ax_top.set_ylim(ymin - pad, ymax + pad)
+
+        # Vol curve + moving average
+        ax_top.plot(x, v,    color=fg, linewidth=1.0)
+        ax_top.plot(x, v_ma, color=fg, linewidth=1.6, alpha=0.8)
+
+        # Bars: volume if present, otherwise "volatility bars"
+        if volume_col in window_df:
+            bars = window_df[volume_col].values.astype(float)
+        else:
+            bars = v
+        ax_bot.bar(x, bars, color=fg, width=0.8)
+
+    plt.savefig(out_path, facecolor=bg, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+
 # -----------------------------------------------------
 # 7) Assembly: labels generation + images & CSV
 # -----------------------------------------------------
@@ -223,11 +314,17 @@ def build_dataset(csv_path: Path,
                   deseason: bool = False,
                   image_windows: Optional[List[int]] = None,  # ex: [64, 96, 128]
                   image_step: int = 1,
-                  splits: Optional[Tuple[str, Optional[str]]] = None  # ("2024-12-31","2025-03-31")
-                  ) -> None:
+                  splits: Optional[Tuple[str, Optional[str]]] = None,  # ("2024-12-31","2025-03-31")
+                  image_encoder: str = "heatmap",
+                  ts_ma_window: int = 60,
+                  img_w: int = 256, img_h: int = 256, img_dpi: int = 100) -> None:
 
     df = load_ohlcv(csv_path)
+    ohlcv = df[["open","high","low","close"] + ([ "volume"] if "volume" in df.columns else [])].copy()
     vol = garman_klass_sigma(df) # vol by interval (GK)
+    if not isinstance(vol.index, pd.DatetimeIndex):
+        vol.index = pd.to_datetime(vol.index, utc=True, errors="coerce")
+    vol = vol.sort_index()
     if deseason:
         vol = intraday_deseasonalize(vol).dropna()
 
@@ -254,27 +351,44 @@ def build_dataset(csv_path: Path,
                     continue
                 # base features for the image: [vol, median_hist]
                 F = part_df[["vol", "median_hist"]].copy()
-                idx_pairs = window_indices(len(F), win=max(image_windows), step=image_step)
+                idx_pairs = window_indices(len(part_df), win=max(image_windows), step=image_step)
 
                 for (a, b) in idx_pairs:
-                    win_df = F.iloc[a:b]
-                    # Associated label to right edge of the window (b-1)
-                    end_ts = F.index[b - 1]
-                    row = part_df.loc[end_ts]
-                    y = int(row[f"y_h{h}"])
-                    # File: out_dir/symbol/split/h{h}/label/
+                    # fenêtre d’index temporels alignée
+                    idx = part_df.index[a:b]
+                    end_ts = idx[-1]
+                    y = int(part_df.loc[end_ts, f"y_h{h}"])
                     out_path = out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{end_ts.value}.png"
-                    to_heatmap_image(win_df.T, out_path)  # (features x time)
-                    meta_all.append({
-                        "symbol": symbol,
-                        "split": split_name,
-                        "horizon": h,
-                        "end_ts": end_ts,
-                        "img_path": str(out_path),
-                        "label": y,
-                        "vol_tplus_h": part_df.loc[end_ts, "vol"],
-                        "median_hist_at_t": part_df.loc[end_ts, "median_hist"]
-                    })
+
+                    if image_encoder == "heatmap":
+                        # features simples pour heatmap
+                        win_df = part_df.loc[idx, ["vol","median_hist"]]
+                        to_heatmap_image(win_df.T, out_path, mode="colormap", cmap="viridis")  # ta fonction heatmap existante
+
+                    elif image_encoder == "ts_vol":
+                        # panel volatilité (vol + MA + barres)
+                        win_df = pd.DataFrame(index=idx)
+                        win_df["vol"] = vol.reindex(idx)  # vol est le Series retourné par garman_klass_sigma
+                        if "volume" in ohlcv.columns:
+                            win_df["volume"] = ohlcv["volume"].reindex(idx)
+                        if win_df["vol"].isna().any():
+                            continue  # skip fenêtres incomplètes
+                        to_timeseries_image(win_df, out_path, kind="vol",
+                                            vol_col="vol", ma_window=ts_ma_window,
+                                            width_px=img_w, height_px=img_h, dpi=img_dpi)
+
+                    elif image_encoder == "ts_ohlc":
+                        # panel chandeliers (OHLC + MA(close) + volume)
+                        needed = ["open","high","low","close"]
+                        if not set(needed).issubset(ohlcv.columns):
+                            continue  # pas d'OHLC -> skip
+                        win_df = ohlcv.reindex(idx)
+                        if win_df[needed].isna().any().any():
+                            continue
+                        to_timeseries_image(win_df, out_path, kind="ohlc",
+                                            ma_window=ts_ma_window,
+                            width_px=img_w, height_px=img_h, dpi=img_dpi)
+
         else:
             # If no images, we save a CSV of labels per split
             for split_name, part_df in parts:
@@ -304,6 +418,11 @@ def parse_args():
     p.add_argument("--image_step", type=int, default=1)
     p.add_argument("--train_end", type=str, default=None)
     p.add_argument("--val_end", type=str, default=None)
+    p.add_argument("--image_encoder", choices=["heatmap","ts_vol","ts_ohlc"], default="heatmap",help="Type d’images à générer.")
+    p.add_argument("--ts_ma_window", type=int, default=60, help="MA pour les images time-series.")
+    p.add_argument("--img_w", type=int, default=256)
+    p.add_argument("--img_h", type=int, default=256)
+    p.add_argument("--img_dpi", type=int, default=100)
     return p.parse_args()
 
 
@@ -320,4 +439,7 @@ if __name__ == "__main__":
                   deseason=args.deseason,
                   image_windows=args.image_windows,
                   image_step=args.image_step,
-                  splits=splits)
+                  splits=splits,
+                  image_encoder=args.image_encoder,
+                  ts_ma_window=args.ts_ma_window,
+                  img_w=args.img_w, img_h=args.img_h, img_dpi=args.img_dpi)

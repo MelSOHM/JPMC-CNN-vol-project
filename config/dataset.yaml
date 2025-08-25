@@ -1,0 +1,41 @@
+# config.yaml
+data:
+  csv: sub_data.csv
+  symbol: AAPL
+  tz_utc: true
+  time_col: ts_event 
+
+output:
+  dir: ./dataset_out
+
+splits:
+  # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
+  train_end: 2025-08-15
+  val_end: 2025-08-20
+
+labels:
+  horizons: [1, 2]
+  median_window: 100
+
+deseasonalization:
+  mode: none    # none | robust_train | robust_expanding
+  bucket: hour        # minute | hour
+
+images:
+  encoder: ts_vol       # heatmap | ts_vol | ts_ohlc
+  windows: [32]
+  step: 32               # set to window size for no overlap
+  ts_ma_window: 48
+  size:
+    width: 256
+    height: 256
+    dpi: 100
+  # heatmap:
+  #   mode: greyscale      # colormap | rgb
+  #   cmap: viridis
+  #   vmin: null          # put numbers to enforce global scale (e.g., 0.0)
+  #   vmax: null
+
+evaluation:
+  embargo_steps: 0      # e.g., 128 + max(horizons)
+  no_overlap: false     # if true, step becomes max(images.windows)

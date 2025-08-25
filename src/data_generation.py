@@ -7,6 +7,7 @@ import argparse
 import math
 from pathlib import Path
 from typing import List, Optional, Tuple
+import re
 
 import numpy as np
 import pandas as pd
@@ -14,27 +15,175 @@ import pandas as pd
 from PIL import Image
 import matplotlib.pyplot as plt
 
+import vol_smile_deseasonal as vol_smile
+
 
 # ---------------------------
 # 1) Loading & Prep
 # ---------------------------
 
+# --- YAML config loader/merger -----------------------------------------------
+from types import SimpleNamespace
+
+try:
+    import yaml
+except ImportError as e:
+    yaml = None 
+
+def _resolve_config_path(p: str | Path) -> Path:
+    p = Path(p)
+    if p.is_absolute():
+        return p
+    here = Path(__file__).parent
+    return (here / p).resolve()
+
+from pathlib import Path
+
+def load_yaml_config(path: str | Path) -> dict:
+    """
+    Robust YAML resolver:
+    - If absolute path -> use it.
+    - Else try, in order: CWD/path, <script_dir>/path, <script_dir>/../path.
+    """
+    if yaml is None:
+        raise ImportError("PyYAML is required for --config. Install with: pip install pyyaml")
+
+    p = Path(path)
+    candidates = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        here = Path(__file__).parent
+        candidates += [Path.cwd() / p, here / p, here.parent / p]
+
+    tried = []
+    for cand in candidates:
+        tried.append(str(cand))
+        if cand.exists():
+            with open(cand, "r") as f:
+                return yaml.safe_load(f) or {}
+
+    raise FileNotFoundError(f"Config file not found. Tried: {tried}")
+
+def merge_args_with_config(args) -> SimpleNamespace:
+    """
+    Merge CLI args with YAML config (if provided).
+    CLI overrides config; config provides defaults when CLI is empty.
+    Returns a SimpleNamespace with all fields the script expects.
+    """
+    cfg = {}
+    if getattr(args, "config", None):
+        cfg = load_yaml_config(args.config)
+
+    def get(cfg_path, default=None):
+        d = cfg
+        for key in cfg_path.split("."):
+            if not isinstance(d, dict) or key not in d:
+                return default
+            d = d[key]
+        return d
+
+    # Base (CLI wins over YAML)
+    csv = args.csv or get("data.csv")
+    out = args.out or get("output.dir")
+    symbol = args.symbol or get("data.symbol")
+    tz_utc = get("data.tz_utc", True)
+    time_col = args.time_col or get("data.time_col", None)
+
+    train_end = args.train_end or get("splits.train_end")
+    val_end   = args.val_end or get("splits.val_end")
+
+    horizons = args.horizons or get("labels.horizons", [1, 2])
+    median_window = args.median_window if args.median_window is not None else get("labels.median_window", 100)
+
+    deseason_mode = args.deseason_mode or get("deseasonalization.mode", "none")
+    deseason_bucket = args.deseason_bucket or get("deseasonalization.bucket", "minute")
+
+    image_encoder = args.image_encoder or get("images.encoder", "heatmap")
+    image_windows = args.image_windows or get("images.windows", [128])
+    image_step = args.image_step if args.image_step is not None else get("images.step", 1)
+    ts_ma_window = args.ts_ma_window if args.ts_ma_window is not None else get("images.ts_ma_window", 60)
+
+    img_w = args.img_w if args.img_w is not None else get("images.size.width", 256)
+    img_h = args.img_h if args.img_h is not None else get("images.size.height", 256)
+    img_dpi = args.img_dpi if args.img_dpi is not None else get("images.size.dpi", 100)
+
+    heatmap_mode = get("images.heatmap.mode", "colormap")
+    heatmap_cmap = get("images.heatmap.cmap", "viridis")
+    heatmap_vmin = get("images.heatmap.vmin", None)
+    heatmap_vmax = get("images.heatmap.vmax", None)
+
+    embargo_steps = args.embargo_steps if getattr(args, "embargo_steps", None) is not None else get("evaluation.embargo_steps", 0)
+    no_overlap = get("evaluation.no_overlap", False)
+
+    # Apply no_overlap policy (if requested) by making step == max(window)
+    if no_overlap and image_windows:
+        image_step = max(image_windows)
+
+    # Basic validation
+    missing = []
+    if not csv:    missing.append("--csv or data.csv")
+    if not out:    missing.append("--out or output.dir")
+    if not symbol: missing.append("--symbol or data.symbol")
+    if missing:
+        raise ValueError("Missing required config: " + ", ".join(missing))
+
+    return SimpleNamespace(
+        csv=csv, out=out, symbol=symbol, tz_utc=tz_utc, time_col=time_col,
+        train_end=train_end, val_end=val_end,
+        horizons=horizons, median_window=median_window,
+        deseason_mode=deseason_mode, deseason_bucket=deseason_bucket,
+        image_encoder=image_encoder, image_windows=image_windows, image_step=image_step,
+        ts_ma_window=ts_ma_window, img_w=img_w, img_h=img_h, img_dpi=img_dpi,
+        heatmap_mode=heatmap_mode, heatmap_cmap=heatmap_cmap,
+        heatmap_vmin=heatmap_vmin, heatmap_vmax=heatmap_vmax,
+        embargo_steps=embargo_steps
+    )
+    
+def ts_to_filename(ts) -> str:
+    """Safe file name from a timestamp or any index-like key."""
+    try:
+        t = pd.to_datetime(ts, utc=True)
+        return t.strftime("%Y%m%dT%H%M%S%fZ")
+    except Exception:
+        s = str(ts)
+        return re.sub(r"[^0-9A-Za-z_-]+", "-", s)
+
 def load_ohlcv(csv_path: Path,
                tz_utc: bool = True,
-               parse_dates_col: str = "timestamp") -> pd.DataFrame:
+               time_col: str | None = None) -> pd.DataFrame:
     """
-    Expect a CSV with columns: timestamp, open, high, low, close, volume.
-    The timstamp must be sorted in increasing order
+    Expect a CSV with columns: <time>, open, high, low, close[, volume].
+    Sets a tz-aware DatetimeIndex. Autodetects `time_col` if not provided.
     """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
     df = pd.read_csv(csv_path)
-    if parse_dates_col in df.columns:
-        df[parse_dates_col] = pd.to_datetime(df[parse_dates_col], utc=tz_utc)
-        df = df.sort_values(parse_dates_col)
-        df = df.set_index(parse_dates_col)
+
+    # 1) choose time_col
+    if time_col is None:
+        candidates = ["timestamp", "ts_event", "datetime", "time", "date"]
+        for c in candidates:
+            if c in df.columns:
+                time_col = c
+                break
+    if time_col is None or time_col not in df.columns:
+        raise ValueError(f"Cannot find time column. Provide --time_col or data.time_col in YAML. "
+                         f"CSV columns: {list(df.columns)}")
+
+    # 2) parse + set index
+    df[time_col] = pd.to_datetime(df[time_col], utc=tz_utc, errors="coerce")
+    df = df.dropna(subset=[time_col]).sort_values(time_col).set_index(time_col)
+
+    # 3) validate OHLC
     req = {"open", "high", "low", "close"}
-    if not req.issubset(set(df.columns)):
-        raise ValueError(f"Colonnes manquantes: {req - set(df.columns)}")
+    miss = req - set(df.columns)
+    if miss:
+        raise ValueError(f"Missing columns {miss}. Present: {list(df.columns)}")
     return df
+
 
 
 # ------------------------------------------
@@ -57,48 +206,8 @@ def garman_klass_sigma(df: pd.DataFrame,
         return np.sqrt(var_gk).rename("sigma_gk")
     return var_gk.rename("var_gk")
 
-# ---------------------------------------------------------
-# 3) Get Rid of intraday Volatility Smile
-# ---------------------------------------------------------
-
-def intraday_deseasonalize(vol: pd.Series,
-                           method: str = "median",
-                           index_is_datetime: bool = True) -> pd.Series:
-    """
-    Decrease intraday seasonal effect
-    Compute a minute/time of day factor via median and mean, then divide
-    """
-    if not index_is_datetime:
-        return vol
-
-    # Exemple pour séries horaires: groupby par (heure, minute)
-    tod = list(zip(vol.index.hour, vol.index.minute))
-    gb = pd.Series(tod, index=vol.index)
-    df = pd.DataFrame({"vol": vol, "tod": gb})
-    if method == "median":
-        f = df.groupby("tod")["vol"].median()
-    else:
-        f = df.groupby("tod")["vol"].mean()
-
-    def norm_one(ts):
-        key = (ts.hour, ts.minute)
-        denom = f.get(key, np.nan)
-        if denom and denom > 0:
-            return ts
-        return ts
-
-    norm = vol.copy()
-    for idx, val in vol.items():
-        denom = f.get((idx.hour, idx.minute), np.nan)
-        if pd.notna(denom) and denom > 0:
-            norm.loc[idx] = val / denom
-        else:
-            norm.loc[idx] = np.nan
-    return norm.rename(vol.name + "_deseason")
-
-
 # -----------------------------------------------
-# 4) Rolling Median and ex-ante t+h labels
+# 3) Rolling Median and ex-ante t+h labels
 # -----------------------------------------------
 
 def rolling_median_ex_ante(x: pd.Series, window: int) -> pd.Series:
@@ -125,7 +234,7 @@ def make_labels(vol: pd.Series,
     return out
 
 # -------------------------------------------------
-# 5) (train/val/test) temporal split 
+# 4) (train/val/test) temporal split 
 # -------------------------------------------------
 
 def ensure_datetime_index(df: pd.DataFrame, time_col: str | None = None, utc: bool = True) -> pd.DataFrame:
@@ -170,7 +279,7 @@ def time_split(df: pd.DataFrame,
 
 
 # ------------------------------------------------------
-# 6) Image generation
+# 5) Image generation
 # ------------------------------------------------------
 
 # Kind : Heatmap 
@@ -303,7 +412,7 @@ def to_timeseries_image(
     plt.close(fig)
 
 # -----------------------------------------------------
-# 7) Assembly: labels generation + images & CSV
+# 6) Assembly: labels generation + images & CSV
 # -----------------------------------------------------
 
 def build_dataset(csv_path: Path,
@@ -311,27 +420,53 @@ def build_dataset(csv_path: Path,
                   symbol: str,
                   horizon_list: List[int] = [1, 2],
                   median_window: int = 100,
-                  deseason: bool = False,
+                  deseason_mode: str = "none",
+                  deseason_bucket: str = "hour",
                   image_windows: Optional[List[int]] = None,  # ex: [64, 96, 128]
                   image_step: int = 1,
                   splits: Optional[Tuple[str, Optional[str]]] = None,  # ("2024-12-31","2025-03-31")
                   image_encoder: str = "heatmap",
                   ts_ma_window: int = 60,
-                  img_w: int = 256, img_h: int = 256, img_dpi: int = 100) -> None:
+                  img_w: int = 256, img_h: int = 256, img_dpi: int = 100,
+                  heatmap_cmap: str = "viridis",
+                  heatmap_vmin: float | None = None,
+                  heatmap_vmax: float | None = None) -> None:
 
     df = load_ohlcv(csv_path)
     ohlcv = df[["open","high","low","close"] + ([ "volume"] if "volume" in df.columns else [])].copy()
-    vol = garman_klass_sigma(df) # vol by interval (GK)
-    if not isinstance(vol.index, pd.DatetimeIndex):
-        vol.index = pd.to_datetime(vol.index, utc=True, errors="coerce")
-    vol = vol.sort_index()
-    if deseason:
-        vol = intraday_deseasonalize(vol).dropna()
+    
+    # Ensure datetime index
+    # if not isinstance(df.index, pd.DatetimeIndex):
+    #     df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+    #     df = df.sort_index()
+
+    vol_raw = garman_klass_sigma(df).sort_index()
+    # if not isinstance(vol_raw.index, pd.DatetimeIndex):
+    #     vol_raw.index = pd.to_datetime(vol_raw.index, utc=True, errors="coerce")
+    #     vol_raw = vol_raw.sort_index()
+
+    # Decide on de-seasonalization
+    if deseason_mode == "none":
+        vol_src = vol_raw
+
+    elif deseason_mode == "robust_train":
+        if splits is None or splits[0] is None:
+            raise ValueError("robust_train de-seasonalization requires --train_end to fit stats on train only.")
+        train_end = pd.to_datetime(splits[0], utc=True)
+        stats = vol_smile.fit_robust_tod_stats(vol_raw.loc[:train_end], bucket=deseason_bucket)
+        vol_src = vol_smile.apply_robust_tod_zscore(vol_raw, stats, bucket=deseason_bucket)
+
+    elif deseason_mode == "robust_expanding":
+        vol_src = vol_smile.deseason_robust_expanding(vol_raw, bucket=deseason_bucket)
+
+    else:
+        raise ValueError("Unknown deseason_mode")
+
 
     meta_all = []
 
     for h in horizon_list:
-        lab = make_labels(vol, horizon=h, median_window=median_window, drop_na=True)
+        lab = make_labels(vol_src, horizon=h, median_window=median_window, drop_na=True)
         lab["symbol"] = symbol
         lab["horizon"] = h
 
@@ -339,7 +474,7 @@ def build_dataset(csv_path: Path,
         if splits is not None:
             train_end = pd.to_datetime(splits[0], utc=True)
             val_end = pd.to_datetime(splits[1], utc=True) if splits[1] else None
-            train, val, test = time_split(lab, train_end, val_end, time_col="ts_event")
+            train, val, test = time_split(lab, train_end, val_end)
             parts = [("train", train), ("val", val), ("test", test)]
         else:
             parts = [("full", lab)]
@@ -347,6 +482,7 @@ def build_dataset(csv_path: Path,
         # Images
         if image_windows:
             for split_name, part_df in parts:
+                print(f"[INFO] split={split_name} len={len(part_df)} first={part_df.index.min()} last={part_df.index.max()}")
                 if part_df.empty:
                     continue
                 # base features for the image: [vol, median_hist]
@@ -358,17 +494,20 @@ def build_dataset(csv_path: Path,
                     idx = part_df.index[a:b]
                     end_ts = idx[-1]
                     y = int(part_df.loc[end_ts, f"y_h{h}"])
-                    out_path = out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{end_ts.value}.png"
+                    fname = ts_to_filename(end_ts)                   # <-- nouveau
+                    out_path = out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
 
                     if image_encoder == "heatmap":
                         # features simples pour heatmap
                         win_df = part_df.loc[idx, ["vol","median_hist"]]
-                        to_heatmap_image(win_df.T, out_path, mode="colormap", cmap="viridis")  # ta fonction heatmap existante
+                        to_heatmap_image(win_df.T, out_path,
+                                        cmap=heatmap_cmap,
+                                        vmin=heatmap_vmin, vmax=heatmap_vmax)
 
                     elif image_encoder == "ts_vol":
                         # panel volatilité (vol + MA + barres)
                         win_df = pd.DataFrame(index=idx)
-                        win_df["vol"] = vol.reindex(idx)  # vol est le Series retourné par garman_klass_sigma
+                        win_df["vol"] = vol_src.reindex(idx)  # vol est le Series retourné par garman_klass_sigma
                         if "volume" in ohlcv.columns:
                             win_df["volume"] = ohlcv["volume"].reindex(idx)
                         if win_df["vol"].isna().any():
@@ -408,38 +547,49 @@ def build_dataset(csv_path: Path,
 
 def parse_args():
     p = argparse.ArgumentParser(description="Build volatility image dataset with GK labels.")
-    p.add_argument("--csv", type=Path, required=True, help="Chemin vers un CSV OHLCV")
-    p.add_argument("--out", type=Path, required=True, help="Dossier de sortie")
-    p.add_argument("--symbol", type=str, required=True)
-    p.add_argument("--horizons", type=int, nargs="+", default=[1, 2], help="Ex: 1 2")
-    p.add_argument("--median_window", type=int, default=100)
-    p.add_argument("--deseason", action="store_true", help="Normalisation intra-day")
+    p.add_argument("--config", type=str, default="./config/dataset.yaml", help="Path to a YAML config file.")
+    p.add_argument("--csv", type=Path, default=None, help="Chemin vers un CSV OHLCV")
+    p.add_argument("--out", type=Path, default=None, help="Dossier de sortie")
+    p.add_argument("--symbol", type=str, default=None)
+    p.add_argument("--horizons", type=int, nargs="+", default=None, help="Ex: 1 2")
+    p.add_argument("--median_window", type=int, default=None)
     p.add_argument("--image_windows", type=int, nargs="*", default=None, help="Taille(s) de fenêtre pour images")
-    p.add_argument("--image_step", type=int, default=1)
+    p.add_argument("--image_step", type=int, default=None)
     p.add_argument("--train_end", type=str, default=None)
     p.add_argument("--val_end", type=str, default=None)
-    p.add_argument("--image_encoder", choices=["heatmap","ts_vol","ts_ohlc"], default="heatmap",help="Type d’images à générer.")
-    p.add_argument("--ts_ma_window", type=int, default=60, help="MA pour les images time-series.")
-    p.add_argument("--img_w", type=int, default=256)
-    p.add_argument("--img_h", type=int, default=256)
-    p.add_argument("--img_dpi", type=int, default=100)
+    p.add_argument("--image_encoder", choices=["heatmap","ts_vol","ts_ohlc"], default=None,help="Type d’images à générer.")
+    p.add_argument("--ts_ma_window", type=int, default=None, help="MA pour les images time-series.")
+    p.add_argument("--img_w", type=int, default=None)
+    p.add_argument("--img_h", type=int, default=None)
+    p.add_argument("--img_dpi", type=int, default=None)
+    p.add_argument("--deseason_mode", choices=["none","robust_train","robust_expanding"], default=None,
+               help="De-seasonalization mode for volatility: none, robust fit-on-train, or strict expanding ex-ante.")
+    p.add_argument("--deseason_bucket", choices=["minute","hour"], default=None,
+               help="Time-of-day bucket granularity for de-seasonalization.")
+    p.add_argument("--time_col", type=str, default=None,
+               help="Name of the timestamp column in the CSV.")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    m = merge_args_with_config(args)
     splits = None
-    if args.train_end:
-        splits = (args.train_end, args.val_end)
-    build_dataset(csv_path=args.csv,
-                  out_dir=args.out,
-                  symbol=args.symbol,
-                  horizon_list=args.horizons,
-                  median_window=args.median_window,
-                  deseason=args.deseason,
-                  image_windows=args.image_windows,
-                  image_step=args.image_step,
-                  splits=splits,
-                  image_encoder=args.image_encoder,
-                  ts_ma_window=args.ts_ma_window,
-                  img_w=args.img_w, img_h=args.img_h, img_dpi=args.img_dpi)
+    if m.train_end:
+        splits = (m.train_end, m.val_end)
+    build_dataset(csv_path=Path(m.csv),
+                out_dir=Path(m.out),
+                symbol=m.symbol,
+                horizon_list=m.horizons,
+                median_window=m.median_window,
+                image_windows=m.image_windows,
+                image_step=m.image_step,
+                splits=(m.train_end, m.val_end) if m.train_end else None,
+                deseason_mode=m.deseason_mode,
+                deseason_bucket=m.deseason_bucket,
+                image_encoder=m.image_encoder,
+                ts_ma_window=m.ts_ma_window,
+                img_w=m.img_w, img_h=m.img_h, img_dpi=m.img_dpi,
+                heatmap_cmap=m.heatmap_cmap,
+                heatmap_vmin=m.heatmap_vmin,
+                heatmap_vmax=m.heatmap_vmax)

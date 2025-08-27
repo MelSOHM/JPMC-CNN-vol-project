@@ -184,8 +184,6 @@ def load_ohlcv(csv_path: Path,
         raise ValueError(f"Missing columns {miss}. Present: {list(df.columns)}")
     return df
 
-
-
 # ------------------------------------------
 # 2) Garman–Klass Volatility (interval-based)
 # ------------------------------------------
@@ -216,19 +214,44 @@ def rolling_median_ex_ante(x: pd.Series, window: int) -> pd.Series:
     """
     return x.shift(1).rolling(window=window, min_periods=window).median()
 
+def lookahead_by_days(s: pd.Series, days: int) -> pd.Series:
+    """
+    Return a series aligned on s.index whose value at time t is s at the first
+    timestamp >= (t + days). Works with tz-aware DatetimeIndex and irregular grids.
+    """
+    if not isinstance(s.index, pd.DatetimeIndex):
+        raise TypeError("lookahead_by_days expects a DatetimeIndex")
+    idx = s.index
+    target = idx + pd.Timedelta(days=days)
+    # position of first index >= target (bfill on indexer)
+    pos = idx.get_indexer(target, method="bfill")
+    out = pd.Series(np.nan, index=idx, name=f"{s.name}_tplus_{days}D")
+    ok = pos != -1
+    if ok.any():
+        vals = s.to_numpy()
+        out.iloc[ok] = vals[pos[ok]]
+    return out
 
 def make_labels(vol: pd.Series,
-                horizon: int = 1,
+                horizon_days: int = 1,
                 median_window: int = 100,
                 drop_na: bool = True) -> pd.DataFrame:
     """
-    Label y_t = 1{ vol_{t+h} > median_{t} } ; median_t = Rolling ex-ante median.
-    - horizon: t+1 or t+2 (etc.)
-    - median_window: Window lenght for historical median.
+    Build ex-ante binary labels using a *calendar-day* horizon:
+      y_t = 1{ vol_{first ts >= t + horizon_days} > median_hist_t },
+    where median_hist_t is the rolling historical median up to t-1.
+    Notes:
+      - horizon measured in days (calendar).
+      - if no future timestamp exists, label is NaN and will be dropped.
     """
+    # historical median (no look-ahead at t)
     med = rolling_median_ex_ante(vol, window=median_window).rename("median_hist")
-    y = (vol.shift(-horizon) > med).astype("float").rename(f"y_h{horizon}")
-    out = pd.concat({"vol": vol, "median_hist": med, f"y_h{horizon}": y}, axis=1)
+
+    # future vol at first timestamp >= t + horizon_days
+    vfut = lookahead_by_days(vol, horizon_days).rename(f"vol_tplus_{horizon_days}D")
+
+    y = (vfut > med).astype("float").rename(f"y_h{horizon_days}")
+    out = pd.concat({"vol": vol, "median_hist": med, f"y_h{horizon_days}": y}, axis=1)
     if drop_na:
         out = out.dropna()
     return out
@@ -434,21 +457,12 @@ def build_dataset(csv_path: Path,
 
     df = load_ohlcv(csv_path)
     ohlcv = df[["open","high","low","close"] + ([ "volume"] if "volume" in df.columns else [])].copy()
-    
-    # Ensure datetime index
-    # if not isinstance(df.index, pd.DatetimeIndex):
-    #     df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
-    #     df = df.sort_index()
-
     vol_raw = garman_klass_sigma(df).sort_index()
-    # if not isinstance(vol_raw.index, pd.DatetimeIndex):
-    #     vol_raw.index = pd.to_datetime(vol_raw.index, utc=True, errors="coerce")
-    #     vol_raw = vol_raw.sort_index()
 
     # Decide on de-seasonalization
     if deseason_mode == "none":
         vol_src = vol_raw
-
+        
     elif deseason_mode == "robust_train":
         if splits is None or splits[0] is None:
             raise ValueError("robust_train de-seasonalization requires --train_end to fit stats on train only.")
@@ -462,11 +476,10 @@ def build_dataset(csv_path: Path,
     else:
         raise ValueError("Unknown deseason_mode")
 
-
     meta_all = []
 
     for h in horizon_list:
-        lab = make_labels(vol_src, horizon=h, median_window=median_window, drop_na=True)
+        lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
         lab["symbol"] = symbol
         lab["horizon"] = h
 
@@ -482,7 +495,6 @@ def build_dataset(csv_path: Path,
         # Images
         if image_windows:
             for split_name, part_df in parts:
-                print(f"[INFO] split={split_name} len={len(part_df)} first={part_df.index.min()} last={part_df.index.max()}")
                 if part_df.empty:
                     continue
                 # base features for the image: [vol, median_hist]
@@ -490,11 +502,10 @@ def build_dataset(csv_path: Path,
                 idx_pairs = window_indices(len(part_df), win=max(image_windows), step=image_step)
 
                 for (a, b) in idx_pairs:
-                    # fenêtre d’index temporels alignée
                     idx = part_df.index[a:b]
                     end_ts = idx[-1]
                     y = int(part_df.loc[end_ts, f"y_h{h}"])
-                    fname = ts_to_filename(end_ts)                   # <-- nouveau
+                    fname = ts_to_filename(end_ts)
                     out_path = out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
 
                     if image_encoder == "heatmap":
@@ -505,9 +516,9 @@ def build_dataset(csv_path: Path,
                                         vmin=heatmap_vmin, vmax=heatmap_vmax)
 
                     elif image_encoder == "ts_vol":
-                        # panel volatilité (vol + MA + barres)
+                        # volatility panel (vol + MA + barres)
                         win_df = pd.DataFrame(index=idx)
-                        win_df["vol"] = vol_src.reindex(idx)  # vol est le Series retourné par garman_klass_sigma
+                        win_df["vol"] = vol_src.reindex(idx)  # vol -> garman_klass_sigma
                         if "volume" in ohlcv.columns:
                             win_df["volume"] = ohlcv["volume"].reindex(idx)
                         if win_df["vol"].isna().any():
@@ -517,7 +528,6 @@ def build_dataset(csv_path: Path,
                                             width_px=img_w, height_px=img_h, dpi=img_dpi)
 
                     elif image_encoder == "ts_ohlc":
-                        # panel chandeliers (OHLC + MA(close) + volume)
                         needed = ["open","high","low","close"]
                         if not set(needed).issubset(ohlcv.columns):
                             continue  # pas d'OHLC -> skip

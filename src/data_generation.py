@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import vol_smile_deseasonal as vol_smile
 import indicators
 from tqdm.auto import tqdm
-from image_generations import to_heatmap_image, to_recurrence_image, to_timeseries_image, to_gaf_image
+from image_generations import to_heatmap_image, to_recurrence_image, to_timeseries_image, to_gaf_image, compute_global_indicators
 
 
 # ---------------------------
@@ -130,6 +130,7 @@ def merge_args_with_config(args) -> SimpleNamespace:
 
     bottom_panel = get("images.ts_overlays.bottom.panel", "volume")  # volume|rsi|none
     rsi_window   = get("images.ts_overlays.bottom.rsi_window", 14)
+    rsi_source  = get("images.ts_overlays.bottom.rsi_source", "vol")  # 'vol' or 'close'
 
     # --- style (shared) ---
     fg = get("images.style.fg", "white")
@@ -179,7 +180,7 @@ def merge_args_with_config(args) -> SimpleNamespace:
         heatmap_vmin=heatmap_vmin, heatmap_vmax=heatmap_vmax,
         embargo_steps=embargo_steps, show_ma_top=show_ma_top,
         bb_enabled=bb_enabled, bb_window=bb_window, bb_nstd=bb_nstd,
-        bottom_panel=bottom_panel, rsi_window=rsi_window,
+        bottom_panel=bottom_panel, rsi_window=rsi_window, rsi_source=rsi_source,
         fg=fg, bg=bg, rp_series=rp_series, rp_normalize=rp_normalize, rp_metric=rp_metric,
         rp_epsilon_mode=rp_epsilon_mode, rp_epsilon_q=rp_epsilon_q,
         rp_epsilon_value=rp_epsilon_value, rp_binarize=rp_binarize,
@@ -439,6 +440,7 @@ def build_dataset(csv_path: Path,
                   bb_nstd: float = 2.0,
                   bottom_panel: str = "volume",   # volume|rsi|none
                   rsi_window: int = 14,
+                  rsi_source: int = 'vol',
                   fg: str = "white",
                   bg: str = "black",
                   rp_series: str = "vol",          # "vol" | "close" | <any column name in part_df/ohlcv>
@@ -485,6 +487,16 @@ def build_dataset(csv_path: Path,
 
     else:
         raise ValueError("Unknown deseason_mode")
+    
+    ind = compute_global_indicators(
+        vol=vol_src,
+        ohlcv=ohlcv,
+        ma_window=ts_ma_window,
+        bb_window=bb_window,     # ← depuis YAML (images.ts_overlays.top.bb_window)
+        bb_nstd=bb_nstd,         # ← depuis YAML (images.ts_overlays.top.bb_nstd)
+        rsi_window=rsi_window,   # ← depuis YAML (images.ts_overlays.bottom.rsi_window)
+        rsi_source=rsi_source,   # ← depuis YAML (vol|close)
+    )
 
     meta_all = []
 
@@ -530,30 +542,30 @@ def build_dataset(csv_path: Path,
                                         vmin=heatmap_vmin, vmax=heatmap_vmax)
 
                     elif image_encoder == "ts_vol":
-                        # volatility panel (vol + MA + barres)
                         win_df = pd.DataFrame(index=idx)
-                        win_df["vol"] = vol_src.reindex(idx)  # vol -> garman_klass_sigma
+                        win_df["vol"] = vol_src.reindex(idx)
                         if "volume" in ohlcv.columns:
                             win_df["volume"] = ohlcv["volume"].reindex(idx)
                         if win_df["vol"].isna().any():
-                            continue  # skip fenêtres incomplètes
-                        # to_timeseries_image(win_df, out_path, kind="vol",
-                        #                     vol_col="vol", ma_window=ts_ma_window,
-                        #                     width_px=img_w, height_px=img_h, dpi=img_dpi)
+                            continue
+
+                        # slice precomputed indicators for this exact window
+                        win_ind = ind.loc[idx]
                         to_timeseries_image(
-                            win_df, out_path,
-                            kind="vol",
-                            vol_col="vol",
+                            win_df, out_path, kind="vol", vol_col="vol",
                             ma_window=ts_ma_window,
-                            # overlays from YAML
+                            # overlays (toggles de ta YAML)
+                            show_ma_top=show_ma_top,
                             show_bbands=bb_enabled,
-                            bb_window=bb_window,
-                            bb_nstd=bb_nstd,
-                            bottom_panel=bottom_panel,   # "volume" | "rsi" | "none"
-                            rsi_window=rsi_window,
+                            bb_window=bb_window, bb_nstd=bb_nstd,
+                            bottom_panel=bottom_panel, rsi_window=rsi_window,
+                            # --- provide precomputed series ---
+                            ma_series=win_ind["vol_ma"],
+                            bb_up_series=win_ind["bb_up"],
+                            bb_lo_series=win_ind["bb_lo"],
+                            rsi_series=win_ind["rsi"] if bottom_panel == "rsi" else None,
                             # style/size
-                            fg=fg, bg=bg,
-                            width_px=img_w, height_px=img_h, dpi=img_dpi
+                            fg=fg, bg=bg, width_px=img_w, height_px=img_h, dpi=img_dpi
                         )
 
                     elif image_encoder == "ts_ohlc":
@@ -657,6 +669,12 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     m = merge_args_with_config(args)
+    clean_scope = getattr(m, "clean_scope", "symbol")   # par défaut on nettoie le symbole courant
+    do_clean    = getattr(m, "clean", True)             # active/désactive via YAML/CLI
+
+    if do_clean and clean_scope:
+        n = indicators.clean_dataset_dir(Path(m.out), symbol=m.symbol, what=clean_scope)
+        print(f"[CLEAN] Removed {n} item(s) under '{clean_scope}' before generation.")
     splits = None
     if m.train_end:
         splits = (m.train_end, m.val_end)
@@ -677,7 +695,7 @@ if __name__ == "__main__":
                 heatmap_vmin=m.heatmap_vmin,
                 heatmap_vmax=m.heatmap_vmax,
                 show_ma_top=m.show_ma_top, bb_enabled=m.bb_enabled, bb_window=m.bb_window, bb_nstd=m.bb_nstd,
-                bottom_panel=m.bottom_panel, rsi_window=m.rsi_window,
+                bottom_panel=m.bottom_panel, rsi_window=m.rsi_window, rsi_source=m.rsi_source,
                 fg=m.fg, bg=m.bg,     
                 rp_series=m.rp_series,
                 rp_normalize=m.rp_normalize,

@@ -41,11 +41,12 @@ images: # Use 30min bucket / use only market data
     top:
       show_ma: true          # show the moving average on the top panel
       show_bbands: true      # draw Bollinger bands on the volatility line
-      bb_window: 20
+      bb_window: 13
       bb_nstd: 2.0
     bottom:
       panel: volume             # volume | rsi | none
       rsi_window: 14
+      rsi_source: vol   # vol | close
     style:
       fg: white
       bg: black

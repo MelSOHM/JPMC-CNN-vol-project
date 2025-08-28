@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 
 import indicators
 from tqdm.auto import tqdm
+from indicators import *
 
 # Kind : Heatmap 
 
@@ -43,6 +44,42 @@ def to_heatmap_image(window_df: pd.DataFrame,
 
 # Kind: Time series
 
+def compute_global_indicators(
+    vol: pd.Series,
+    ohlcv: pd.DataFrame,
+    *,
+    ma_window: int,
+    bb_window: int,
+    bb_nstd: float,
+    rsi_window: int,
+    rsi_source: str = "vol",
+) -> pd.DataFrame:
+    """
+    Compute once, on the full dataset:
+      - vol_ma (trailing SMA)
+      - Bollinger bands on vol (mid/up/lo)
+      - RSI on chosen series ('vol' or 'close')
+    All are trailing (no look-ahead).
+    """
+    ind = pd.DataFrame(index=vol.index)
+    ind["vol"] = vol
+
+    # MA(vol)
+    ind["vol_ma"] = sma(vol, window=ma_window, min_periods=1)
+
+    # Bollinger(vol)
+    mid, up, lo = bollinger_bands(vol, window=bb_window, nstd=bb_nstd, min_periods=1)
+    ind["bb_mid"], ind["bb_up"], ind["bb_lo"] = mid, up, lo
+
+    # RSI(source)
+    if rsi_source == "close" and "close" in ohlcv.columns:
+        src = ohlcv["close"].reindex(vol.index)
+    else:
+        src = vol
+    ind["rsi"] = rsi_wilder(src, window=rsi_window)
+
+    return ind
+
 def to_timeseries_image(
     window_df: pd.DataFrame,
     out_path: Path,
@@ -59,6 +96,10 @@ def to_timeseries_image(
     bb_nstd: float = 2.0,
     bottom_panel: str = "volume",   # volume | rsi | none
     rsi_window: int = 14,
+    ma_series: pd.Series | None = None,
+    bb_up_series: pd.Series | None = None,
+    bb_lo_series: pd.Series | None = None,
+    rsi_series: pd.Series | None = None,
     # style
     fg: str = "white",
     bg: str = "black",
@@ -111,38 +152,54 @@ def to_timeseries_image(
 
     else:  # kind == "vol"
         v = pd.Series(window_df[vol_col].values.astype(float), index=window_df.index)
-        v_ma = v.rolling(ma_window, min_periods=1).mean().values if show_ma_top else None
+
+        # MA(vol): use precomputed if provided, else compute locally
+        if show_ma_top:
+            if ma_series is not None:
+                v_ma = ma_series.to_numpy(dtype=float)
+            else:
+                v_ma = v.rolling(ma_window, min_periods=1).mean().to_numpy()
+        else:
+            v_ma = None
 
         # y-limits include overlays if any
-        ymin, ymax = v.min(), v.max()
-        if show_ma_top and np.isfinite(np.nanmax(v_ma)):
-            ymin = min(ymin, np.nanmin(v_ma)); ymax = max(ymax, np.nanmax(v_ma))
+        ymin, ymax = float(np.nanmin(v)), float(np.nanmax(v))
+        if show_ma_top and v_ma is not None and np.isfinite(np.nanmax(v_ma)):
+            ymin = min(ymin, float(np.nanmin(v_ma))); ymax = max(ymax, float(np.nanmax(v_ma)))
+
+        # Bollinger: use precomputed if provided, else compute locally
         if show_bbands:
-            bb_mid, bb_up, bb_lo = indicators.bollinger_bands(v, window=bb_window, nstd=bb_nstd, min_periods=1)
-            ymin = min(ymin, float(bb_lo.min())); ymax = max(ymax, float(bb_up.max()))
+            if (bb_up_series is not None) and (bb_lo_series is not None):
+                bb_up = bb_up_series.to_numpy(dtype=float)
+                bb_lo = bb_lo_series.to_numpy(dtype=float)
+            else:
+                mid, up, lo = bollinger_bands(v, window=bb_window, nstd=bb_nstd, min_periods=1)
+                bb_up, bb_lo = up.to_numpy(dtype=float), lo.to_numpy(dtype=float)
+            ymin = min(ymin, float(np.nanmin(bb_lo))); ymax = max(ymax, float(np.nanmax(bb_up)))
+
         pad = 0.05 * (ymax - ymin if ymax > ymin else 1.0)
         ax_top.set_ylim(ymin - pad, ymax + pad)
 
-        # main line
+        # main / MA / BB
         ax_top.plot(x, v.values, color=fg, linewidth=1.0)
-        if show_ma_top:
-            ax_top.plot(x, v_ma, color=fg, linewidth=1.6, alpha=0.85)
+        if show_ma_top and v_ma is not None:
+            ax_top.plot(x, v_ma, color=fg, linewidth=1.6, alpha=0.85, linestyle='dashed')
         if show_bbands:
-            ax_top.plot(x, bb_up.values, color=fg, linewidth=0.9, alpha=0.6)
-            ax_top.plot(x, bb_lo.values, color=fg, linewidth=0.9, alpha=0.6)
-            # optional mid:
-            # ax_top.plot(x, bb_mid.values, color=fg, linewidth=0.8, alpha=0.4, linestyle="--")
+            ax_top.plot(x, bb_up, color=fg, linewidth=0.9, alpha=0.6)
+            ax_top.plot(x, bb_lo, color=fg, linewidth=0.9, alpha=0.6)
 
-        # bottom panel selection
+        # bottom panel
         bp = (bottom_panel or "volume").lower()
         if bp == "rsi":
-            rsi = indicators.rsi_wilder(v, window=rsi_window)
+            if rsi_series is not None:
+                rsi_vals = rsi_series.to_numpy(dtype=float)
+            else:
+                rsi_vals = rsi_wilder(v, window=rsi_window).to_numpy(dtype=float)
             ax_bot.set_ylim(0, 100)
-            ax_bot.plot(x, rsi.values, color=fg, linewidth=1.2)
+            ax_bot.plot(x, rsi_vals, color=fg, linewidth=1.2)
             ax_bot.hlines([30,70], 0, len(x)-1, colors=fg, linewidth=0.8, alpha=0.4, linestyles="dashed")
         elif bp == "volume" and "volume" in window_df:
             ax_bot.bar(x, window_df[volume_col].values.astype(float), color=fg, width=0.8)
-        # elif bp == "none": do nothing
 
     plt.savefig(out_path, facecolor=bg, bbox_inches="tight", pad_inches=0)
     plt.close(fig)

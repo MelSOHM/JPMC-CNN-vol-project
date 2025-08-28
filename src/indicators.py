@@ -3,6 +3,8 @@
 from __future__ import annotations
 import numpy as np
 import pandas as pd
+from pathlib import Path
+import shutil, os, stat
 
 _EPS = 1e-12
 
@@ -68,3 +70,82 @@ def zscore(x: pd.Series, window: int = 20, min_periods: int = 5) -> pd.Series:
     z = (x - mean) / (std.replace(0, np.nan))
     z.name = f"z_{window}"
     return z
+
+# --- safe cleanup utilities ---
+def _chmod_rw(path: Path):
+    """Ensure path is deletable. Directories need +x to be traversable."""
+    try:
+        if path.is_dir():
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)   # 0o700 on owner
+        else:
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)                   # 0o600 on owner
+    except Exception:
+        pass
+
+def _onerror_chmod(func, path, exc_info):
+    """
+    rmtree onerror handler: make the path writable/executable (if dir) then retry.
+    """
+    try:
+        p = Path(path)
+        _chmod_rw(p)
+        func(path)  # retry the failed operation (unlink/rmdir)
+    except Exception:
+        # give up; shutil will raise after this handler returns
+        pass
+
+def clean_dataset_dir(out_dir: Path,
+                      *,
+                      symbol: str | None = None,
+                      what: str = "symbol") -> int:
+    """
+    Remove previously generated artifacts before a new run.
+
+    what:
+      - "symbol": delete <out_dir>/<symbol>
+      - "splits": delete only train/val/test/full under <out_dir>/<symbol>
+      - "all":    delete all children under <out_dir>
+    """
+    out_dir = Path(out_dir).resolve()
+    if not out_dir.exists():
+        return 0
+    if str(out_dir) in ("/", "", str(Path.home())):
+        raise RuntimeError(f"Refuse to clean unsafe path: {out_dir}")
+
+    def _rmtree(p: Path):
+        if not p.exists():
+            return
+        if p.is_symlink():
+            # don't descend into symlinks; just unlink
+            p.unlink(missing_ok=True)
+            return
+        # pre-pass: best effort to make everything deletable
+        for root, dirs, files in os.walk(p, topdown=False, followlinks=False):
+            for name in files:
+                _chmod_rw(Path(root) / name)
+            for name in dirs:
+                _chmod_rw(Path(root) / name)
+        # main removal with robust onerror handler
+        shutil.rmtree(p, ignore_errors=False, onerror=_onerror_chmod)
+
+    removed = 0
+    if what == "all":
+        for child in out_dir.iterdir():
+            _rmtree(child); removed += 1
+    elif what == "symbol":
+        if not symbol:
+            raise ValueError("clean_dataset_dir: 'symbol' is required when what='symbol'.")
+        target = out_dir / symbol
+        if target.exists():
+            _rmtree(target); removed += 1
+    elif what == "splits":
+        if not symbol:
+            raise ValueError("clean_dataset_dir: 'symbol' is required when what='splits'.")
+        for split in ("train", "val", "test", "full"):
+            target = out_dir / symbol / split
+            if target.exists():
+                _rmtree(target); removed += 1
+    else:
+        raise ValueError("clean_dataset_dir: 'what' must be one of {'symbol','splits','all'}.")
+
+    return removed

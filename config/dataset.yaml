@@ -1,6 +1,7 @@
 # config.yaml
 data:
-  csv: sub_data.csv
+  csv: Data/apple/MBP.csv
+  # csv: sub_data.csv
   symbol: AAPL
   tz_utc: true
   time_col: ts_event 

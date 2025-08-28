@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 
 import vol_smile_deseasonal as vol_smile
 import indicators
+from tqdm.auto import tqdm
 
 
 # ---------------------------
@@ -542,7 +543,13 @@ def build_dataset(csv_path: Path,
                     continue
                 idx_pairs = window_indices(len(part_df), win=max(image_windows), step=image_step)
 
-                for (a, b) in idx_pairs:
+                for (a, b) in tqdm(
+                    idx_pairs,
+                    desc=f"Generating {image_encoder} images | {symbol} | {split_name} | horizon={h}d",
+                    total=len(idx_pairs),
+                    dynamic_ncols=True,
+                    leave=False
+                ):
                     idx = part_df.index[a:b]
                     end_ts = idx[-1]
                     y = int(part_df.loc[end_ts, f"y_h{h}"])

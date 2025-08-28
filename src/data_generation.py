@@ -116,11 +116,24 @@ def merge_args_with_config(args) -> SimpleNamespace:
     img_w = args.img_w if args.img_w is not None else get("images.size.width", 256)
     img_h = args.img_h if args.img_h is not None else get("images.size.height", 256)
     img_dpi = args.img_dpi if args.img_dpi is not None else get("images.size.dpi", 100)
+    
+    # Aligment start of day
+    align_enabled   = get("images.alignment.enabled", False)
+    align_time_str  = get("images.alignment.anchor_time", "14:00")
+    align_tz        = get("images.alignment.anchor_tz", "UTC")
 
     heatmap_mode = get("images.heatmap.mode", "colormap")
     heatmap_cmap = get("images.heatmap.cmap", "viridis")
     heatmap_vmin = get("images.heatmap.vmin", None)
     heatmap_vmax = get("images.heatmap.vmax", None)
+    
+    # --- Day separator (ts_vol) ---
+    day_sep_enabled = get("images.ts_overlays.day_separators.enabled", False)
+    day_sep_label   = get("images.ts_overlays.day_separators.label", True)
+    day_sep_color   = get("images.ts_overlays.day_separators.color", "#888888")
+    day_sep_alpha   = get("images.ts_overlays.day_separators.alpha", 0.35)
+    day_sep_lw      = get("images.ts_overlays.day_separators.linewidth", 0.8)
+    day_label_kind  = get("images.ts_overlays.day_separators.label_kind", "number")
     
     # --- overlays (ts_vol) ---
     show_ma_top  = get("images.ts_overlays.top.show_ma", True)
@@ -175,9 +188,16 @@ def merge_args_with_config(args) -> SimpleNamespace:
         horizons=horizons, median_window=median_window,
         deseason_mode=deseason_mode, deseason_bucket=deseason_bucket,
         image_encoder=image_encoder, image_windows=image_windows, image_step=image_step,
+        align_enabled=align_enabled, align_time_str=align_time_str, align_tz=align_tz,
         ts_ma_window=ts_ma_window, img_w=img_w, img_h=img_h, img_dpi=img_dpi,
         heatmap_mode=heatmap_mode, heatmap_cmap=heatmap_cmap,
         heatmap_vmin=heatmap_vmin, heatmap_vmax=heatmap_vmax,
+        day_sep_enabled=day_sep_enabled,
+        day_sep_label=day_sep_label,
+        day_sep_color=day_sep_color,
+        day_sep_alpha=day_sep_alpha,
+        day_sep_lw=day_sep_lw,
+        day_label_kind=day_label_kind,
         embargo_steps=embargo_steps, show_ma_top=show_ma_top,
         bb_enabled=bb_enabled, bb_window=bb_window, bb_nstd=bb_nstd,
         bottom_panel=bottom_panel, rsi_window=rsi_window, rsi_source=rsi_source,
@@ -366,6 +386,49 @@ def ensure_datetime_index(df: pd.DataFrame, time_col: str | None = None, utc: bo
         return out
     except Exception as e:
         raise TypeError("A DatetimeIndex or a valid time_col is required for time_split.") from e
+    
+def realign_to_day_anchor(df: pd.DataFrame,
+                          anchor_time: str = "14:00",
+                          anchor_tz: str = "UTC") -> tuple[pd.DataFrame, pd.Timestamp | None]:
+    """
+    Slice the DataFrame so that the *first row* is the first timestamp >=
+    the day 'anchor_time' in 'anchor_tz'.
+    - Keeps original tz/index; we only use a tz-converted *view* to find the cut index.
+    - If no anchor found (e.g., tail-short), returns (df, None).
+
+    Example:
+      If df starts at 13:30 and anchor=14:00, the first kept row will be the first bar >= 14:00
+      of that same day (or the next day if today's 14:00 is already past).
+    """
+    if df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return df, None
+
+    idx = df.index
+    # convert to anchor tz (view only)
+    idx_local = (idx.tz_convert(anchor_tz) if idx.tz is not None
+                 else idx.tz_localize("UTC").tz_convert(anchor_tz))
+
+    # parse HH:MM
+    try:
+        hh, mm = map(int, anchor_time.split(":")[:2])
+    except Exception as e:
+        raise ValueError(f"Bad anchor_time '{anchor_time}', expected 'HH:MM'") from e
+
+    first_day = idx_local[0].normalize()
+    anchor0 = first_day + pd.Timedelta(hours=hh, minutes=mm)
+
+    # If our first timestamp is already after today's anchor, keep today's anchor;
+    # else jump to the next day's anchor.
+    target = anchor0 if idx_local[0] <= anchor0 else (anchor0 + pd.Timedelta(days=1))
+
+    # position of first index >= target
+    pos = idx_local.get_indexer([target], method="bfill")[0]
+    if pos == -1:
+        return df, None
+
+    df2 = df.iloc[pos:].copy()
+    return df2, df.index[pos]
+
 
 def time_split(df: pd.DataFrame,
                train_end: pd.Timestamp,
@@ -431,9 +494,18 @@ def build_dataset(csv_path: Path,
                   image_encoder: str = "heatmap",
                   ts_ma_window: int = 60,
                   img_w: int = 256, img_h: int = 256, img_dpi: int = 100,
+                  align_enabled: bool = False,
+                  align_time_str: str = "14:00",
+                  align_tz: str = "UTC",
                   heatmap_cmap: str = "viridis",
                   heatmap_vmin: float | None = None,
                   heatmap_vmax: float | None = None,
+                  day_sep_enabled: bool = False,
+                  day_sep_label: bool = True,
+                  day_sep_color: str = "#888888",
+                  day_sep_alpha: float = 0.35,
+                  day_sep_lw: float = 0.8,
+                  day_label_kind: str = "number",   # number | abbr | name
                   show_ma_top: bool = True,
                   bb_enabled: bool = False,
                   bb_window: int = 20,
@@ -499,7 +571,6 @@ def build_dataset(csv_path: Path,
     )
 
     meta_all = []
-
     for h in horizon_list:
         lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
         lab["symbol"] = symbol
@@ -513,6 +584,21 @@ def build_dataset(csv_path: Path,
             parts = [("train", train), ("val", val), ("test", test)]
         else:
             parts = [("full", lab)]
+            
+        if align_enabled:
+            aligned_parts = []
+            for split_name, part_df in parts:
+                if part_df.empty:
+                    aligned_parts.append((split_name, part_df))
+                    continue
+                part_aligned, anchor_ts = realign_to_day_anchor(
+                    part_df, anchor_time=align_time_str, anchor_tz=align_tz
+                )
+                kept = len(part_aligned); drop = len(part_df) - kept
+                print(f"[ALIGN] split={split_name} anchor={align_time_str} {align_tz} "
+                    f"dropped={drop} kept={kept} first={anchor_ts}")
+                aligned_parts.append((split_name, part_aligned))
+            parts = aligned_parts
 
         # Images
         if image_windows:
@@ -520,7 +606,6 @@ def build_dataset(csv_path: Path,
                 if part_df.empty:
                     continue
                 idx_pairs = window_indices(len(part_df), win=max(image_windows), step=image_step)
-
                 for (a, b) in tqdm(
                     idx_pairs,
                     desc=f"Generating {image_encoder} images | {symbol} | {split_name} | horizon={h}d",
@@ -559,6 +644,13 @@ def build_dataset(csv_path: Path,
                             show_bbands=bb_enabled,
                             bb_window=bb_window, bb_nstd=bb_nstd,
                             bottom_panel=bottom_panel, rsi_window=rsi_window,
+                            #day sep
+                            show_day_separators=day_sep_enabled,
+                            day_sep_label=day_sep_label,
+                            day_sep_color=day_sep_color,
+                            day_sep_alpha=day_sep_alpha,
+                            day_sep_lw=day_sep_lw,
+                            day_label_kind=day_label_kind,
                             # --- provide precomputed series ---
                             ma_series=win_ind["vol_ma"],
                             bb_up_series=win_ind["bb_up"],
@@ -691,9 +783,18 @@ if __name__ == "__main__":
                 image_encoder=m.image_encoder,
                 ts_ma_window=m.ts_ma_window,
                 img_w=m.img_w, img_h=m.img_h, img_dpi=m.img_dpi,
+                align_enabled=m.align_enabled,
+                align_time_str=m.align_time_str,
+                align_tz=m.align_tz,
                 heatmap_cmap=m.heatmap_cmap,
                 heatmap_vmin=m.heatmap_vmin,
                 heatmap_vmax=m.heatmap_vmax,
+                day_sep_enabled=m.day_sep_enabled,
+                day_sep_label=m.day_sep_label,
+                day_sep_color=m.day_sep_color,
+                day_sep_alpha=m.day_sep_alpha,
+                day_sep_lw=m.day_sep_lw,
+                day_label_kind=m.day_label_kind,
                 show_ma_top=m.show_ma_top, bb_enabled=m.bb_enabled, bb_window=m.bb_window, bb_nstd=m.bb_nstd,
                 bottom_panel=m.bottom_panel, rsi_window=m.rsi_window, rsi_source=m.rsi_source,
                 fg=m.fg, bg=m.bg,     

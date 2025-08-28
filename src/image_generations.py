@@ -44,6 +44,48 @@ def to_heatmap_image(window_df: pd.DataFrame,
 
 # Kind: Time series
 
+# --- helper: day separators ---
+def _draw_day_separators(ax, idx: pd.DatetimeIndex,
+                         color="#888888", alpha=0.35, lw=0.8,
+                         add_labels=True, label_kind="number"):
+    """
+    Draw vertical lines at the start of each new calendar day within `idx`
+    and optionally label them near the top of the plot.
+
+    label_kind: "number" (1..7), "abbr" ("lun", "mar"...), or "name" ("lundi"...).
+    """
+    if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
+        return
+
+    days = idx.normalize()
+    starts = np.r_[True, days[1:].values != days[:-1].values]   # True at each day start
+    pos = np.where(starts)[0]
+    # évite la toute première barre (bord gauche)
+    pos = [p for p in pos if p != 0]
+    if not pos:
+        return
+
+    # label dictionaries
+    map_abbr_en  = {1:"Mon",2:"Tue",3:"Wed",4:"Thu",5:"Fri",6:"Sat",7:"Sun"}
+    map_name_en  = {1:"Monday",2:"Tuesday",3:"Wednesday",4:"Thursday",5:"Friday",6:"Saturday",7:"Sunday"}
+
+    y0, y1 = ax.get_ylim()
+    y_txt = y1 - 0.02*(y1 - y0)  # 2% sous le haut
+
+    for p in pos:
+        ax.axvline(p, color=color, alpha=alpha, linewidth=lw)
+        if add_labels:
+            wd = int(idx[p].weekday()) + 1  # Monday=1 ... Sunday=7
+            if label_kind == "abbr":
+                txt = map_abbr_en.get(wd, str(wd))
+            elif label_kind == "name":
+                txt = map_name_en.get(wd, str(wd))
+            else:
+                txt = str(wd)
+            ax.text(p + 0.2, y_txt, txt, color=color, fontsize=7,
+                    va="top", ha="left", alpha=alpha)
+
+
 def compute_global_indicators(
     vol: pd.Series,
     ohlcv: pd.DataFrame,
@@ -95,6 +137,14 @@ def to_timeseries_image(
     bb_window: int = 20,
     bb_nstd: float = 2.0,
     bottom_panel: str = "volume",   # volume | rsi | none
+    # Day sep
+    show_day_separators: bool = False,
+    day_sep_label: bool = True,
+    day_sep_color: str = "#888888",
+    day_sep_alpha: float = 0.35,
+    day_sep_lw: float = 0.8,
+    day_label_kind: str = "number",   # "number" | "abbr" | "name"
+    # Indicators
     rsi_window: int = 14,
     ma_series: pd.Series | None = None,
     bb_up_series: pd.Series | None = None,
@@ -136,7 +186,11 @@ def to_timeseries_image(
         ymin = np.nanmin(l); ymax = np.nanmax(h)
         pad = 0.03 * (ymax - ymin if ymax > ymin else 1.0)
         ax_top.set_ylim(ymin - pad, ymax + pad)
-
+        if show_day_separators:
+            _draw_day_separators(ax_top, window_df.index,
+                                 color=day_sep_color, alpha=day_sep_alpha, lw=day_sep_lw,
+                                 add_labels=day_sep_label,
+                                 label_kind=day_label_kind)
         # --- line-style candlesticks (as in the sample paper) ---
         ax_top.vlines(x, l, h, colors=fg, linewidth=1.0)
         ax_top.hlines(o, x - 0.25, x,        colors=fg, linewidth=1.0)  # open tick on the left
@@ -179,7 +233,11 @@ def to_timeseries_image(
 
         pad = 0.05 * (ymax - ymin if ymax > ymin else 1.0)
         ax_top.set_ylim(ymin - pad, ymax + pad)
-
+        if show_day_separators:
+            _draw_day_separators(ax_top, window_df.index,
+                                 color=day_sep_color, alpha=day_sep_alpha, lw=day_sep_lw,
+                                 add_labels=day_sep_label,
+                                 label_kind=day_label_kind)
         # main / MA / BB
         ax_top.plot(x, v.values, color=fg, linewidth=1.0)
         if show_ma_top and v_ma is not None:

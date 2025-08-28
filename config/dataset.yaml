@@ -36,6 +36,10 @@ images: # Use 30min bucket / use only market data
     width: 256
     height: 256
     dpi: 100
+  alignment:
+    enabled: true
+    anchor_time: "14:00"   # HH:MM interprété dans anchor_tz
+    anchor_tz: "UTC"  
 
   ts_overlays:
     top:
@@ -50,6 +54,13 @@ images: # Use 30min bucket / use only market data
     style:
       fg: white
       bg: black
+    day_separators:
+      enabled: true
+      label: true
+      color: "#888888"
+      alpha: 0.5
+      linewidth: 0.8
+      label_kind: number    # number | abbr | name
     
   recurrence:
     series: vol         # vol | close | median_hist | ...

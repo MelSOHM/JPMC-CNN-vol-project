@@ -92,6 +92,12 @@ def merge_args_with_config(args) -> SimpleNamespace:
     symbol = args.symbol or get("data.symbol")
     tz_utc = get("data.tz_utc", True)
     time_col = args.time_col or get("data.time_col", None)
+    
+    # resample
+    rs_rule   = get("data.resample.rule", None)
+    rs_label  = get("data.resample.label", "left")
+    rs_closed = get("data.resample.closed", "left")
+    rs_dropna = get("data.resample.drop_na", True)
 
     train_end = args.train_end or get("splits.train_end")
     val_end   = args.val_end or get("splits.val_end")
@@ -163,6 +169,7 @@ def merge_args_with_config(args) -> SimpleNamespace:
 
     return SimpleNamespace(
         csv=csv, out=out, symbol=symbol, tz_utc=tz_utc, time_col=time_col,
+        rs_rule=rs_rule, rs_label=rs_label, rs_closed=rs_closed, rs_dropna=rs_dropna,
         train_end=train_end, val_end=val_end,
         horizons=horizons, median_window=median_window,
         deseason_mode=deseason_mode, deseason_bucket=deseason_bucket,
@@ -191,10 +198,15 @@ def ts_to_filename(ts) -> str:
 
 def load_ohlcv(csv_path: Path,
                tz_utc: bool = True,
-               time_col: str | None = None) -> pd.DataFrame:
+               time_col: str | None = None,
+               *,
+               rs_rule: str | None = None,
+               rs_label: str = "left",
+               rs_closed: str = "left",
+               rs_dropna: bool = True) -> pd.DataFrame:
     """
     Expect a CSV with columns: <time>, open, high, low, close[, volume].
-    Sets a tz-aware DatetimeIndex. Autodetects `time_col` if not provided.
+    Sets a tz-aware DatetimeIndex. Optionally resamples to a coarser bar.
     """
     csv_path = Path(csv_path)
     if not csv_path.exists():
@@ -202,27 +214,60 @@ def load_ohlcv(csv_path: Path,
 
     df = pd.read_csv(csv_path)
 
-    # 1) choose time_col
+    # choose time_col (auto-detect if not provided)
     if time_col is None:
-        candidates = ["timestamp", "ts_event", "datetime", "time", "date"]
-        for c in candidates:
+        for c in ["timestamp", "ts_event", "datetime", "time", "date"]:
             if c in df.columns:
                 time_col = c
                 break
     if time_col is None or time_col not in df.columns:
-        raise ValueError(f"Cannot find time column. Provide --time_col or data.time_col in YAML. "
-                         f"CSV columns: {list(df.columns)}")
+        raise ValueError(f"Cannot find time column. Provide data.time_col. Columns: {list(df.columns)}")
 
-    # 2) parse + set index
     df[time_col] = pd.to_datetime(df[time_col], utc=tz_utc, errors="coerce")
     df = df.dropna(subset=[time_col]).sort_values(time_col).set_index(time_col)
 
-    # 3) validate OHLC
     req = {"open", "high", "low", "close"}
     miss = req - set(df.columns)
     if miss:
         raise ValueError(f"Missing columns {miss}. Present: {list(df.columns)}")
+
+    if rs_rule:
+        df = resample_ohlcv(df, rs_rule, label=rs_label, closed=rs_closed, drop_na=rs_dropna)
+
     return df
+
+def resample_ohlcv(df: pd.DataFrame,
+                   rule: str,
+                   *,
+                   label: str = "left",
+                   closed: str = "left",
+                   drop_na: bool = True) -> pd.DataFrame:
+    """
+    Resample an OHLC(V) DataFrame to a coarser bar (e.g., 30min, 1h).
+    - open: first, high: max, low: min, close: last, volume: sum (if present)
+    - Keeps tz-aware DatetimeIndex and sorts the index.
+    """
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low":  "min",
+        "close":"last",
+    }
+    if "volume" in df.columns:
+        agg["volume"] = "sum"
+
+    # Only aggregate columns we actually have
+    cols = [c for c in agg.keys() if c in df.columns]
+    out = (
+        df[cols]
+        .resample(rule, label=label, closed=closed)
+        .agg({c: agg[c] for c in cols})
+        .sort_index()
+    )
+
+    if drop_na:
+        out = out.dropna(subset=["open", "high", "low", "close"])
+    return out
 
 # ------------------------------------------
 # 2) Garman–Klass Volatility (interval-based)
@@ -348,6 +393,16 @@ def window_indices(n: int, win: int, step: int) -> List[Tuple[int, int]]:
         start += step
     return idx
 
+def _freq_info(idx):
+    diffs = idx.to_series().diff().dropna()
+    approx = diffs.median() if not diffs.empty else pd.NaT
+    try:
+        inf = pd.infer_freq(idx)
+    except Exception:
+        inf = None
+    print(f"[FREQ] after resample: infer_freq={inf} | median_step={approx} | n={len(idx)} | first={idx.min()} | last={idx.max()}")
+
+
 # ------------------------------------------------------
 # 5) Image generation
 # ------------------------------------------------------
@@ -363,6 +418,10 @@ def build_dataset(csv_path: Path,
                   symbol: str,
                   horizon_list: List[int] = [1, 2],
                   median_window: int = 100,
+                  rs_rule: str | None = None, 
+                  rs_label: str = "left",
+                  rs_closed: str = "left", 
+                  rs_dropna: bool = True,
                   deseason_mode: str = "none",
                   deseason_bucket: str = "hour",
                   image_windows: Optional[List[int]] = None,  # ex: [64, 96, 128]
@@ -397,7 +456,16 @@ def build_dataset(csv_path: Path,
                   gaf_invert: bool = False,
                   ) -> None:
 
-    df = load_ohlcv(csv_path)
+    df = load_ohlcv(
+        csv_path,
+        tz_utc=m.tz_utc if "m" in globals() else True,   # si tu appelles avec m; sinon passe les args reçus
+        time_col=m.time_col if "m" in globals() else None,
+        rs_rule=m.rs_rule,
+        rs_label=m.rs_label,
+        rs_closed=m.rs_closed,
+        rs_dropna=m.rs_dropna,
+    )
+    _freq_info(df.index)
     ohlcv = df[["open","high","low","close"] + ([ "volume"] if "volume" in df.columns else [])].copy()
     vol_raw = garman_klass_sigma(df).sort_index()
 

@@ -1,13 +1,18 @@
 # config.yaml
 data:
-  csv: Data/apple/MBP.csv
+  csv: Data/apple/MBP_market.csv
   # csv: sub_data.csv
   symbol: AAPL
   tz_utc: true
   time_col: ts_event 
+  resample:
+    rule: "30min"     # ex: "30min", "1h", "15min" ; laisse vide/omets pour désactiver
+    label: "right"     # "left" ou "right" -> timestamp du bucket
+    closed: "left"    # "left" ou "right" -> quels bords sont inclus
+    drop_na: true     # drop des buckets incomplets (sans open/close)
 
 output:
-  dir: ./dataset_out_gaf
+  dir: ./dataset_out_ts
 
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
@@ -22,10 +27,10 @@ deseasonalization:
   mode: none    # none | robust_train | robust_expanding
   bucket: hour        # minute | hour
 
-images:
-  encoder: gaf  # heatmap | ts_vol | ts_ohlc | recurrence | gaf
-  windows: [32]
-  step: 32               # set to window size for no overlap
+images: # Use 30min bucket / use only market data 
+  encoder: ts_vol  # heatmap | ts_vol | ts_ohlc | recurrence | gaf
+  windows: [26]
+  step: 26               # set to window size for no overlap
   ts_ma_window: 48
   size:
     width: 256

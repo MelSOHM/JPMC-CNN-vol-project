@@ -16,6 +16,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 import vol_smile_deseasonal as vol_smile
+import indicators
 
 
 # ---------------------------
@@ -112,6 +113,19 @@ def merge_args_with_config(args) -> SimpleNamespace:
     heatmap_cmap = get("images.heatmap.cmap", "viridis")
     heatmap_vmin = get("images.heatmap.vmin", None)
     heatmap_vmax = get("images.heatmap.vmax", None)
+    
+    # --- overlays (ts_vol) ---
+    show_ma_top  = get("images.ts_overlays.top.show_ma", True)
+    bb_enabled   = get("images.ts_overlays.top.show_bbands", False)
+    bb_window    = get("images.ts_overlays.top.bb_window", 20)
+    bb_nstd      = get("images.ts_overlays.top.bb_nstd", 2.0)
+
+    bottom_panel = get("images.ts_overlays.bottom.panel", "volume")  # volume|rsi|none
+    rsi_window   = get("images.ts_overlays.bottom.rsi_window", 14)
+
+    # --- style (shared) ---
+    fg = get("images.style.fg", "white")
+    bg = get("images.style.bg", "black")
 
     embargo_steps = args.embargo_steps if getattr(args, "embargo_steps", None) is not None else get("evaluation.embargo_steps", 0)
     no_overlap = get("evaluation.no_overlap", False)
@@ -137,7 +151,10 @@ def merge_args_with_config(args) -> SimpleNamespace:
         ts_ma_window=ts_ma_window, img_w=img_w, img_h=img_h, img_dpi=img_dpi,
         heatmap_mode=heatmap_mode, heatmap_cmap=heatmap_cmap,
         heatmap_vmin=heatmap_vmin, heatmap_vmax=heatmap_vmax,
-        embargo_steps=embargo_steps
+        embargo_steps=embargo_steps, show_ma_top=show_ma_top,
+        bb_enabled=bb_enabled, bb_window=bb_window, bb_nstd=bb_nstd,
+        bottom_panel=bottom_panel, rsi_window=rsi_window,
+        fg=fg, bg=bg
     )
     
 def ts_to_filename(ts) -> str:
@@ -351,11 +368,19 @@ def to_timeseries_image(
     window_df: pd.DataFrame,
     out_path: Path,
     *,
-    kind: str = "vol",              # "vol" | "ohlc"
-    ma_window: int = 60,            # Moving-average window size
+    kind: str = "vol",
+    ma_window: int = 60,
     price_cols=("open","high","low","close"),
     volume_col: str = "volume",
-    vol_col: str = "vol",           # Volatility column
+    vol_col: str = "vol",
+    # overlays
+    show_ma_top: bool = True,
+    show_bbands: bool = False,
+    bb_window: int = 20,
+    bb_nstd: float = 2.0,
+    bottom_panel: str = "volume",   # volume | rsi | none
+    rsi_window: int = 14,
+    # style
     fg: str = "white",
     bg: str = "black",
     width_px: int = 256,
@@ -374,19 +399,14 @@ def to_timeseries_image(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ---- Figure and axes (80% top / 20% bottom) ----
-    fig_h = height_px / dpi
-    fig_w = width_px / dpi
+    fig_h = height_px / dpi; fig_w = width_px / dpi
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
     gs = fig.add_gridspec(nrows=5, ncols=1, hspace=0.0)
     ax_top = fig.add_subplot(gs[:-1, 0])                 # 4/5 height
     ax_bot = fig.add_subplot(gs[-1, 0], sharex=ax_top)  # 1/5 height
 
-    fig.patch.set_facecolor(bg)
-    ax_top.set_facecolor(bg)
-    ax_bot.set_facecolor(bg)
-    for ax in (ax_top, ax_bot):
-        ax.axis("off")
-        ax.margins(x=0)
+    fig.patch.set_facecolor(bg); ax_top.set_facecolor(bg); ax_bot.set_facecolor(bg)
+    for ax in (ax_top, ax_bot): ax.axis("off"); ax.margins(x=0)
 
     x = np.arange(len(window_df))
 
@@ -411,25 +431,39 @@ def to_timeseries_image(
         ax_bot.bar(x, bars, color=fg, width=0.8)
 
     else:  # kind == "vol"
-        v = window_df[vol_col].values.astype(float)
-        v_ma = pd.Series(v).rolling(ma_window, min_periods=1).mean().values
+        v = pd.Series(window_df[vol_col].values.astype(float), index=window_df.index)
+        v_ma = v.rolling(ma_window, min_periods=1).mean().values if show_ma_top else None
 
-        # y-limits with padding
-        ymin = np.nanmin(np.minimum(v, v_ma))
-        ymax = np.nanmax(np.maximum(v, v_ma))
+        # y-limits include overlays if any
+        ymin, ymax = v.min(), v.max()
+        if show_ma_top and np.isfinite(np.nanmax(v_ma)):
+            ymin = min(ymin, np.nanmin(v_ma)); ymax = max(ymax, np.nanmax(v_ma))
+        if show_bbands:
+            bb_mid, bb_up, bb_lo = indicators.bollinger_bands(v, window=bb_window, nstd=bb_nstd, min_periods=1)
+            ymin = min(ymin, float(bb_lo.min())); ymax = max(ymax, float(bb_up.max()))
         pad = 0.05 * (ymax - ymin if ymax > ymin else 1.0)
         ax_top.set_ylim(ymin - pad, ymax + pad)
 
-        # Vol curve + moving average
-        ax_top.plot(x, v,    color=fg, linewidth=1.0)
-        ax_top.plot(x, v_ma, color=fg, linewidth=1.6, alpha=0.8)
+        # main line
+        ax_top.plot(x, v.values, color=fg, linewidth=1.0)
+        if show_ma_top:
+            ax_top.plot(x, v_ma, color=fg, linewidth=1.6, alpha=0.85)
+        if show_bbands:
+            ax_top.plot(x, bb_up.values, color=fg, linewidth=0.9, alpha=0.6)
+            ax_top.plot(x, bb_lo.values, color=fg, linewidth=0.9, alpha=0.6)
+            # optional mid:
+            # ax_top.plot(x, bb_mid.values, color=fg, linewidth=0.8, alpha=0.4, linestyle="--")
 
-        # Bars: volume if present, otherwise "volatility bars"
-        if volume_col in window_df:
-            bars = window_df[volume_col].values.astype(float)
-        else:
-            bars = v
-        ax_bot.bar(x, bars, color=fg, width=0.8)
+        # bottom panel selection
+        bp = (bottom_panel or "volume").lower()
+        if bp == "rsi":
+            rsi = indicators.rsi_wilder(v, window=rsi_window)
+            ax_bot.set_ylim(0, 100)
+            ax_bot.plot(x, rsi.values, color=fg, linewidth=1.2)
+            ax_bot.hlines([30,70], 0, len(x)-1, colors=fg, linewidth=0.8, alpha=0.4, linestyles="dashed")
+        elif bp == "volume" and "volume" in window_df:
+            ax_bot.bar(x, window_df[volume_col].values.astype(float), color=fg, width=0.8)
+        # elif bp == "none": do nothing
 
     plt.savefig(out_path, facecolor=bg, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
@@ -453,7 +487,16 @@ def build_dataset(csv_path: Path,
                   img_w: int = 256, img_h: int = 256, img_dpi: int = 100,
                   heatmap_cmap: str = "viridis",
                   heatmap_vmin: float | None = None,
-                  heatmap_vmax: float | None = None) -> None:
+                  heatmap_vmax: float | None = None,
+                  show_ma_top: bool = True,
+                  bb_enabled: bool = False,
+                  bb_window: int = 20,
+                  bb_nstd: float = 2.0,
+                  bottom_panel: str = "volume",   # volume|rsi|none
+                  rsi_window: int = 14,
+                  fg: str = "white",
+                  bg: str = "black"
+                  ) -> None:
 
     df = load_ohlcv(csv_path)
     ohlcv = df[["open","high","low","close"] + ([ "volume"] if "volume" in df.columns else [])].copy()
@@ -497,8 +540,6 @@ def build_dataset(csv_path: Path,
             for split_name, part_df in parts:
                 if part_df.empty:
                     continue
-                # base features for the image: [vol, median_hist]
-                F = part_df[["vol", "median_hist"]].copy()
                 idx_pairs = window_indices(len(part_df), win=max(image_windows), step=image_step)
 
                 for (a, b) in idx_pairs:
@@ -523,9 +564,24 @@ def build_dataset(csv_path: Path,
                             win_df["volume"] = ohlcv["volume"].reindex(idx)
                         if win_df["vol"].isna().any():
                             continue  # skip fenêtres incomplètes
-                        to_timeseries_image(win_df, out_path, kind="vol",
-                                            vol_col="vol", ma_window=ts_ma_window,
-                                            width_px=img_w, height_px=img_h, dpi=img_dpi)
+                        # to_timeseries_image(win_df, out_path, kind="vol",
+                        #                     vol_col="vol", ma_window=ts_ma_window,
+                        #                     width_px=img_w, height_px=img_h, dpi=img_dpi)
+                        to_timeseries_image(
+                            win_df, out_path,
+                            kind="vol",
+                            vol_col="vol",
+                            ma_window=ts_ma_window,
+                            # overlays from YAML
+                            show_bbands=bb_enabled,
+                            bb_window=bb_window,
+                            bb_nstd=bb_nstd,
+                            bottom_panel=bottom_panel,   # "volume" | "rsi" | "none"
+                            rsi_window=rsi_window,
+                            # style/size
+                            fg=fg, bg=bg,
+                            width_px=img_w, height_px=img_h, dpi=img_dpi
+                        )
 
                     elif image_encoder == "ts_ohlc":
                         needed = ["open","high","low","close"]
@@ -602,4 +658,8 @@ if __name__ == "__main__":
                 img_w=m.img_w, img_h=m.img_h, img_dpi=m.img_dpi,
                 heatmap_cmap=m.heatmap_cmap,
                 heatmap_vmin=m.heatmap_vmin,
-                heatmap_vmax=m.heatmap_vmax)
+                heatmap_vmax=m.heatmap_vmax,
+                show_ma_top=m.show_ma_top, bb_enabled=m.bb_enabled, bb_window=m.bb_window, bb_nstd=m.bb_nstd,
+                bottom_panel=m.bottom_panel, rsi_window=m.rsi_window,
+                fg=m.fg, bg=m.bg
+            )

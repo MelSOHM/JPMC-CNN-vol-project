@@ -30,6 +30,21 @@ images:
     width: 256
     height: 256
     dpi: 100
+
+  ts_overlays:
+    top:
+      show_ma: true          # show the moving average on the top panel
+      show_bbands: true      # draw Bollinger bands on the volatility line
+      bb_window: 20
+      bb_nstd: 2.0
+    bottom:
+      panel: volume             # volume | rsi | none
+      rsi_window: 14
+
+  style:
+    fg: white
+    bg: black
+
   # heatmap:
   #   mode: greyscale      # colormap | rgb
   #   cmap: viridis

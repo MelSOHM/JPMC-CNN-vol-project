@@ -236,3 +236,70 @@ def to_recurrence_image(
     plt.tight_layout(pad=0)
     plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
     plt.close()
+    
+# Kind : Gamian Angular Fields
+
+def _normalize_1d(x: np.ndarray, mode: str = "minmax") -> np.ndarray:
+    """Normalize to [-1, 1] (required by GAF)."""
+    x = x.astype(float)
+    if mode == "minmax":
+        mn, mx = np.nanmin(x), np.nanmax(x)
+        if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
+            return np.zeros_like(x)
+        x = 2.0 * (x - mn) / (mx - mn) - 1.0
+    elif mode == "zscore":
+        mu, sd = np.nanmean(x), np.nanstd(x)
+        x = (x - mu) / (sd + 1e-8)
+        # project to [-1,1] (robust clamp)
+        x = np.tanh(x)
+    elif mode == "none":
+        # if user promises it's already in [-1,1]
+        pass
+    else:
+        raise ValueError("normalize must be 'minmax', 'zscore', or 'none'")
+    # hard clamp
+    return np.clip(x, -1.0, 1.0)
+
+def _gaf_matrices(x_norm: np.ndarray, mode: str = "gasf") -> np.ndarray:
+    """
+    Build GAF matrix:
+      - GASF: cos(φ_i + φ_j)
+      - GADF: sin(φ_i - φ_j)
+    where φ = arccos(x_norm), x_norm ∈ [-1,1].
+    """
+    phi = np.arccos(x_norm)                 # [T]
+    if mode == "gasf":
+        M = np.cos(phi[:, None] + phi[None, :])
+    elif mode == "gadf":
+        M = np.sin(phi[:, None] - phi[None, :])
+    else:
+        raise ValueError("mode must be 'gasf' or 'gadf'")
+    return M
+
+def to_gaf_image(
+    series: pd.Series,
+    out_path: Path,
+    *,
+    mode: str = "gasf",            # 'gasf' | 'gadf'
+    normalize: str = "minmax",     # 'minmax' | 'zscore' | 'none'
+    cmap: str = "viridis",
+    invert: bool = False,          # invert colormap (visual)
+):
+    """
+    Render a GAF image from a 1D time series (length T).
+    Complexity O(T^2), so keep T in [32..256] typically.
+    """
+    x = series.to_numpy(dtype=float)
+    if x.ndim != 1 or len(x) < 2:
+        raise ValueError("to_gaf_image expects a 1D series of length >= 2")
+
+    x_norm = _normalize_1d(x, mode=normalize)
+    M = _gaf_matrices(x_norm, mode=mode)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure()
+    vmin, vmax = (1.0, -1.0) if invert else (-1.0, 1.0)
+    plt.imshow(M, cmap=cmap, vmin=vmin, vmax=vmax, origin="lower", aspect="equal")
+    plt.axis("off"); plt.tight_layout(pad=0)
+    plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
+    plt.close()

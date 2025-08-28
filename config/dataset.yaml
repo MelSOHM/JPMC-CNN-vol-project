@@ -7,7 +7,7 @@ data:
   time_col: ts_event 
 
 output:
-  dir: ./dataset_out_rp
+  dir: ./dataset_out_gaf
 
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
@@ -23,7 +23,7 @@ deseasonalization:
   bucket: hour        # minute | hour
 
 images:
-  encoder: recurrence  # heatmap | ts_vol | ts_ohlc | recurrence
+  encoder: gaf  # heatmap | ts_vol | ts_ohlc | recurrence | gaf
   windows: [32]
   step: 32               # set to window size for no overlap
   ts_ma_window: 48
@@ -55,6 +55,12 @@ images:
     binarize: true
     cmap: gray
     invert: true
+
+  gaf:
+    mode: gasf           # gasf | gadf
+    normalize: minmax    # minmax | zscore | none
+    cmap: viridis
+    invert: false
 
   # heatmap:
   #   mode: greyscale      # colormap | rgb

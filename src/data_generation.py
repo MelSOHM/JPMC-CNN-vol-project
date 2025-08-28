@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import vol_smile_deseasonal as vol_smile
 import indicators
 from tqdm.auto import tqdm
-from image_generations import to_heatmap_image, to_recurrence_image, to_timeseries_image
+from image_generations import to_heatmap_image, to_recurrence_image, to_timeseries_image, to_gaf_image
 
 
 # ---------------------------
@@ -139,6 +139,12 @@ def merge_args_with_config(args) -> SimpleNamespace:
     rp_binarize      = get("images.recurrence.binarize", True)
     rp_cmap          = get("images.recurrence.cmap", "gray")
     rp_invert        = get("images.recurrence.invert", True)
+    
+    # --- Gamian Angular field ---
+    gaf_mode      = get("images.gaf.mode", "gasf")
+    gaf_normalize = get("images.gaf.normalize", "minmax")
+    gaf_cmap      = get("images.gaf.cmap", "viridis")
+    gaf_invert    = get("images.gaf.invert", False)
 
     embargo_steps = args.embargo_steps if getattr(args, "embargo_steps", None) is not None else get("evaluation.embargo_steps", 0)
     no_overlap = get("evaluation.no_overlap", False)
@@ -170,7 +176,8 @@ def merge_args_with_config(args) -> SimpleNamespace:
         fg=fg, bg=bg, rp_series=rp_series, rp_normalize=rp_normalize, rp_metric=rp_metric,
         rp_epsilon_mode=rp_epsilon_mode, rp_epsilon_q=rp_epsilon_q,
         rp_epsilon_value=rp_epsilon_value, rp_binarize=rp_binarize,
-        rp_cmap=rp_cmap, rp_invert=rp_invert,
+        rp_cmap=rp_cmap, rp_invert=rp_invert,gaf_mode=gaf_mode, gaf_normalize=gaf_normalize,
+        gaf_cmap=gaf_cmap, gaf_invert=gaf_invert,
     )
     
 def ts_to_filename(ts) -> str:
@@ -384,6 +391,10 @@ def build_dataset(csv_path: Path,
                   rp_binarize: bool = True,
                   rp_cmap: str = "gray",
                   rp_invert: bool = True,
+                  gaf_mode: str = "gasf",            # 'gasf' | 'gadf'
+                  gaf_normalize: str = "minmax",     # 'minmax' | 'zscore' | 'none'
+                  gaf_cmap: str = "viridis",
+                  gaf_invert: bool = False,
                   ) -> None:
 
     df = load_ohlcv(csv_path)
@@ -516,6 +527,21 @@ def build_dataset(csv_path: Path,
                             cmap=rp_cmap,
                             invert=rp_invert
                         )
+                    
+                    elif image_encoder == "gaf":
+                        # choose the 1D series to encode (default: volatility)
+                        s = vol_src.reindex(idx)
+                        if s.isna().any():
+                            continue
+                        fname = ts_to_filename(end_ts)
+                        out_path = out_dir / symbol / split_name / f"d{h}" / f"y{y}" / f"{fname}.png"
+                        to_gaf_image(
+                            s, out_path,
+                            mode=gaf_mode,
+                            normalize=gaf_normalize,
+                            cmap=gaf_cmap,
+                            invert=gaf_invert
+                        )
 
         else:
             # If no images, we save a CSV of labels per split
@@ -594,4 +620,8 @@ if __name__ == "__main__":
                 rp_binarize=m.rp_binarize,
                 rp_cmap=m.rp_cmap,
                 rp_invert=m.rp_invert,
+                gaf_mode=m.gaf_mode,
+                gaf_normalize=m.gaf_normalize,
+                gaf_cmap=m.gaf_cmap,
+                gaf_invert=m.gaf_invert,
             )

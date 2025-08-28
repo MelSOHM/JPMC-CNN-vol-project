@@ -7,7 +7,7 @@ data:
   time_col: ts_event 
 
 output:
-  dir: ./dataset_out
+  dir: ./dataset_out_rp
 
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
@@ -23,7 +23,7 @@ deseasonalization:
   bucket: hour        # minute | hour
 
 images:
-  encoder: ts_vol       # heatmap | ts_vol | ts_ohlc
+  encoder: recurrence  # heatmap | ts_vol | ts_ohlc | recurrence
   windows: [32]
   step: 32               # set to window size for no overlap
   ts_ma_window: 48
@@ -41,10 +41,20 @@ images:
     bottom:
       panel: volume             # volume | rsi | none
       rsi_window: 14
-
-  style:
-    fg: white
-    bg: black
+    style:
+      fg: white
+      bg: black
+    
+  recurrence:
+    series: vol         # vol | close | median_hist | ...
+    normalize: zscore   # zscore | minmax | none
+    metric: euclidean
+    epsilon_mode: quantile   # quantile | fixed | none
+    epsilon_q: 0.10           # ~10% density if binarize=True
+    epsilon_value: null       # use if epsilon_mode=fixed
+    binarize: true
+    cmap: gray
+    invert: true
 
   # heatmap:
   #   mode: greyscale      # colormap | rgb

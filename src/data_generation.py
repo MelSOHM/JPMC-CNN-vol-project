@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import vol_smile_deseasonal as vol_smile
 import indicators
 from tqdm.auto import tqdm
+from image_generations import to_heatmap_image, to_recurrence_image, to_timeseries_image
 
 
 # ---------------------------
@@ -127,6 +128,17 @@ def merge_args_with_config(args) -> SimpleNamespace:
     # --- style (shared) ---
     fg = get("images.style.fg", "white")
     bg = get("images.style.bg", "black")
+    
+    # --- Reccurence Plot ---
+    rp_series        = get("images.recurrence.series", "vol")
+    rp_normalize     = get("images.recurrence.normalize", "zscore")
+    rp_metric        = get("images.recurrence.metric", "euclidean")
+    rp_epsilon_mode  = get("images.recurrence.epsilon_mode", "quantile")
+    rp_epsilon_q     = get("images.recurrence.epsilon_q", 0.10)
+    rp_epsilon_value = get("images.recurrence.epsilon_value", None)
+    rp_binarize      = get("images.recurrence.binarize", True)
+    rp_cmap          = get("images.recurrence.cmap", "gray")
+    rp_invert        = get("images.recurrence.invert", True)
 
     embargo_steps = args.embargo_steps if getattr(args, "embargo_steps", None) is not None else get("evaluation.embargo_steps", 0)
     no_overlap = get("evaluation.no_overlap", False)
@@ -155,7 +167,10 @@ def merge_args_with_config(args) -> SimpleNamespace:
         embargo_steps=embargo_steps, show_ma_top=show_ma_top,
         bb_enabled=bb_enabled, bb_window=bb_window, bb_nstd=bb_nstd,
         bottom_panel=bottom_panel, rsi_window=rsi_window,
-        fg=fg, bg=bg
+        fg=fg, bg=bg, rp_series=rp_series, rp_normalize=rp_normalize, rp_metric=rp_metric,
+        rp_epsilon_mode=rp_epsilon_mode, rp_epsilon_q=rp_epsilon_q,
+        rp_epsilon_value=rp_epsilon_value, rp_binarize=rp_binarize,
+        rp_cmap=rp_cmap, rp_invert=rp_invert,
     )
     
 def ts_to_filename(ts) -> str:
@@ -318,13 +333,6 @@ def time_split(df: pd.DataFrame,
         test = df.loc[val_end:]
     return train, val, test
 
-
-# ------------------------------------------------------
-# 5) Image generation
-# ------------------------------------------------------
-
-# Kind : Heatmap 
-
 def window_indices(n: int, win: int, step: int) -> List[Tuple[int, int]]:
     idx = []
     start = 0
@@ -333,141 +341,11 @@ def window_indices(n: int, win: int, step: int) -> List[Tuple[int, int]]:
         start += step
     return idx
 
-def to_heatmap_image(window_df: pd.DataFrame,
-                     out_path: Path,
-                     cmap: str = "gray",
-                     vmin: Optional[float] = None,
-                     vmax: Optional[float] = None):
-    """
-    Encode a (features x temps) bloc into a heatmap (grayscale by default)
-    Each feature is scaled into [0,1] (min-max) before stacking.
-    """
-    # Normalize each feature in the window
-    X = []
-    for col in window_df.columns:
-        v = window_df[col].values.astype(float)
-        vmin_c = np.nanmin(v) if vmin is None else vmin
-        vmax_c = np.nanmax(v) if vmax is None else vmax
-        if np.isfinite(vmin_c) and np.isfinite(vmax_c) and vmax_c > vmin_c:
-            v_norm = (v - vmin_c) / (vmax_c - vmin_c)
-        else:
-            v_norm = np.zeros_like(v)
-        X.append(v_norm)
-    # Matrix (features x time)
-    M = np.vstack(X)
-    plt.figure()
-    plt.imshow(M, aspect="auto", cmap=cmap, origin="lower")  # 2D image
-    plt.axis("off")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout(pad=0)
-    plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
-    plt.close()
+# ------------------------------------------------------
+# 5) Image generation
+# ------------------------------------------------------
 
-# Kind: Time series
-
-def to_timeseries_image(
-    window_df: pd.DataFrame,
-    out_path: Path,
-    *,
-    kind: str = "vol",
-    ma_window: int = 60,
-    price_cols=("open","high","low","close"),
-    volume_col: str = "volume",
-    vol_col: str = "vol",
-    # overlays
-    show_ma_top: bool = True,
-    show_bbands: bool = False,
-    bb_window: int = 20,
-    bb_nstd: float = 2.0,
-    bottom_panel: str = "volume",   # volume | rsi | none
-    rsi_window: int = 14,
-    # style
-    fg: str = "white",
-    bg: str = "black",
-    width_px: int = 256,
-    height_px: int = 256,
-    dpi: int = 100,
-):
-    """
-    Generate a panel image (top: main series + moving average; bottom: bars).
-    - kind="ohlc": line-style candlesticks + MA(close); bars = volume if available.
-    - kind="vol" : volatility line + MA(vol); bars = volume if available, otherwise volatility bars.
-
-    Requirements:
-        * kind="ohlc": window_df must contain open, high, low, close (ideally also volume).
-        * kind="vol" : window_df must contain the `vol_col` column (and volume if desired).
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # ---- Figure and axes (80% top / 20% bottom) ----
-    fig_h = height_px / dpi; fig_w = width_px / dpi
-    fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
-    gs = fig.add_gridspec(nrows=5, ncols=1, hspace=0.0)
-    ax_top = fig.add_subplot(gs[:-1, 0])                 # 4/5 height
-    ax_bot = fig.add_subplot(gs[-1, 0], sharex=ax_top)  # 1/5 height
-
-    fig.patch.set_facecolor(bg); ax_top.set_facecolor(bg); ax_bot.set_facecolor(bg)
-    for ax in (ax_top, ax_bot): ax.axis("off"); ax.margins(x=0)
-
-    x = np.arange(len(window_df))
-
-    if kind == "ohlc":
-        o, h, l, c = [window_df[col].values.astype(float) for col in price_cols]
-        # y-limits with a small padding
-        ymin = np.nanmin(l); ymax = np.nanmax(h)
-        pad = 0.03 * (ymax - ymin if ymax > ymin else 1.0)
-        ax_top.set_ylim(ymin - pad, ymax + pad)
-
-        # --- line-style candlesticks (as in the sample paper) ---
-        ax_top.vlines(x, l, h, colors=fg, linewidth=1.0)
-        ax_top.hlines(o, x - 0.25, x,        colors=fg, linewidth=1.0)  # open tick on the left
-        ax_top.hlines(c, x,        x + 0.25, colors=fg, linewidth=1.0)  # close tick on the right
-
-        # Moving average on close
-        c_ma = pd.Series(c).rolling(ma_window, min_periods=1).mean().values
-        ax_top.plot(x, c_ma, color=fg, linewidth=1.4, alpha=0.85)
-
-        # Bars (volume if available)
-        bars = window_df[volume_col].values.astype(float) if volume_col in window_df else np.zeros_like(x)
-        ax_bot.bar(x, bars, color=fg, width=0.8)
-
-    else:  # kind == "vol"
-        v = pd.Series(window_df[vol_col].values.astype(float), index=window_df.index)
-        v_ma = v.rolling(ma_window, min_periods=1).mean().values if show_ma_top else None
-
-        # y-limits include overlays if any
-        ymin, ymax = v.min(), v.max()
-        if show_ma_top and np.isfinite(np.nanmax(v_ma)):
-            ymin = min(ymin, np.nanmin(v_ma)); ymax = max(ymax, np.nanmax(v_ma))
-        if show_bbands:
-            bb_mid, bb_up, bb_lo = indicators.bollinger_bands(v, window=bb_window, nstd=bb_nstd, min_periods=1)
-            ymin = min(ymin, float(bb_lo.min())); ymax = max(ymax, float(bb_up.max()))
-        pad = 0.05 * (ymax - ymin if ymax > ymin else 1.0)
-        ax_top.set_ylim(ymin - pad, ymax + pad)
-
-        # main line
-        ax_top.plot(x, v.values, color=fg, linewidth=1.0)
-        if show_ma_top:
-            ax_top.plot(x, v_ma, color=fg, linewidth=1.6, alpha=0.85)
-        if show_bbands:
-            ax_top.plot(x, bb_up.values, color=fg, linewidth=0.9, alpha=0.6)
-            ax_top.plot(x, bb_lo.values, color=fg, linewidth=0.9, alpha=0.6)
-            # optional mid:
-            # ax_top.plot(x, bb_mid.values, color=fg, linewidth=0.8, alpha=0.4, linestyle="--")
-
-        # bottom panel selection
-        bp = (bottom_panel or "volume").lower()
-        if bp == "rsi":
-            rsi = indicators.rsi_wilder(v, window=rsi_window)
-            ax_bot.set_ylim(0, 100)
-            ax_bot.plot(x, rsi.values, color=fg, linewidth=1.2)
-            ax_bot.hlines([30,70], 0, len(x)-1, colors=fg, linewidth=0.8, alpha=0.4, linestyles="dashed")
-        elif bp == "volume" and "volume" in window_df:
-            ax_bot.bar(x, window_df[volume_col].values.astype(float), color=fg, width=0.8)
-        # elif bp == "none": do nothing
-
-    plt.savefig(out_path, facecolor=bg, bbox_inches="tight", pad_inches=0)
-    plt.close(fig)
+# Moved to another file
 
 # -----------------------------------------------------
 # 6) Assembly: labels generation + images & CSV
@@ -496,7 +374,16 @@ def build_dataset(csv_path: Path,
                   bottom_panel: str = "volume",   # volume|rsi|none
                   rsi_window: int = 14,
                   fg: str = "white",
-                  bg: str = "black"
+                  bg: str = "black",
+                  rp_series: str = "vol",          # "vol" | "close" | <any column name in part_df/ohlcv>
+                  rp_normalize: str = "zscore",    # "zscore" | "minmax" | "none"
+                  rp_metric: str = "euclidean",    # reserved for future
+                  rp_epsilon_mode: str = "quantile",  # "quantile" | "fixed" | "none"
+                  rp_epsilon_q: float = 0.10,
+                  rp_epsilon_value: float | None = None,
+                  rp_binarize: bool = True,
+                  rp_cmap: str = "gray",
+                  rp_invert: bool = True,
                   ) -> None:
 
     df = load_ohlcv(csv_path)
@@ -600,6 +487,35 @@ def build_dataset(csv_path: Path,
                         to_timeseries_image(win_df, out_path, kind="ohlc",
                                             ma_window=ts_ma_window,
                             width_px=img_w, height_px=img_h, dpi=img_dpi)
+                    
+                    elif image_encoder == "recurrence":
+                        # choose the series to plot
+                        if rp_series == "vol":
+                            s = vol_src.reindex(idx)
+                        elif rp_series == "close":
+                            s = ohlcv["close"].reindex(idx) if "close" in ohlcv.columns else None
+                        else:
+                            # try from part_df first (e.g., "median_hist"), then from ohlcv
+                            s = part_df[rp_series].reindex(idx) if rp_series in part_df.columns else (
+                                ohlcv[rp_series].reindex(idx) if rp_series in ohlcv.columns else None
+                            )
+                        if s is None or s.isna().any():
+                            continue
+
+                        fname = ts_to_filename(end_ts)
+                        out_path = out_dir / symbol / split_name / f"d{h}" / f"y{y}" / f"{fname}.png"
+
+                        to_recurrence_image(
+                            s, out_path,
+                            normalize=rp_normalize,
+                            metric=rp_metric,
+                            epsilon_mode=rp_epsilon_mode,
+                            epsilon_q=rp_epsilon_q,
+                            epsilon_value=rp_epsilon_value,
+                            binarize=rp_binarize,
+                            cmap=rp_cmap,
+                            invert=rp_invert
+                        )
 
         else:
             # If no images, we save a CSV of labels per split
@@ -668,5 +584,14 @@ if __name__ == "__main__":
                 heatmap_vmax=m.heatmap_vmax,
                 show_ma_top=m.show_ma_top, bb_enabled=m.bb_enabled, bb_window=m.bb_window, bb_nstd=m.bb_nstd,
                 bottom_panel=m.bottom_panel, rsi_window=m.rsi_window,
-                fg=m.fg, bg=m.bg
+                fg=m.fg, bg=m.bg,     
+                rp_series=m.rp_series,
+                rp_normalize=m.rp_normalize,
+                rp_metric=m.rp_metric,
+                rp_epsilon_mode=m.rp_epsilon_mode,
+                rp_epsilon_q=m.rp_epsilon_q,
+                rp_epsilon_value=m.rp_epsilon_value,
+                rp_binarize=m.rp_binarize,
+                rp_cmap=m.rp_cmap,
+                rp_invert=m.rp_invert,
             )

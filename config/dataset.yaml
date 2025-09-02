@@ -90,10 +90,29 @@ evaluation:
   no_overlap: false     # if true, step becomes max(images.windows)
 
 training:
+  seed: 42
+  device: auto           # auto | cuda | cpu | mps
+  model: resnet18        # resnet18 | resnet50
+  pretrained: true
+  num_classes: 2
+  epochs: 1
   batch_size: 64
   num_workers: 4
-  normalize: imagenet       # ou null
+  lr: 1e-3
+  weight_decay: 1e-4
+  optimizer: adamw       # adamw | sgd
+  scheduler: cosine      # none | cosine | step
+  step_size: 10          # (if scheduler=step)
+  gamma: 0.1             # (if scheduler=step)
+  use_amp: true
+  monitor: val_f1        # val_f1 | val_loss
+  patience: 7
+  save_dir: runs/exp1
+  normalize: imagenet    # imagenet | null
   augment: false
-  prefer_days: true         # préfère d{N} si d{N} et h{N} coexistent
-  return_meta: true         # renvoie (x, y, meta) plutôt que (x, y)
+  prefer_days: true
+  return_meta: true
   balanced_sampler: false
+  class_weights: false   # if true: Weight cross entropy by inverse frequency
+  show_confusion: true      # false to desactivate
+  normalize_confusion: false  # true ro display in proportions

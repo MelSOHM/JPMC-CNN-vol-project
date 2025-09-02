@@ -210,3 +210,4 @@ __marimo__/
 *.ipynb
 dataset*/
 Data/apple/
+runs/

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # build_dataset.py
-# Dataset builder: OHLCV -> GK vol -> labels (t+1/t+2) -> (optionnel) images
+# Dataset builder: OHLCV -> GK vol -> labels (t+1/t+2)
 # Author: Mel & Daisy (JPMC project)
 
 import argparse

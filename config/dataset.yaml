@@ -20,7 +20,7 @@ splits:
   val_end: 2025-08-20
 
 labels:
-  horizons: [1, 2]
+  horizons: [1]  #Number of days
   median_window: 100
 
 deseasonalization:
@@ -88,3 +88,12 @@ images: # Use 30min bucket / use only market data
 evaluation:
   embargo_steps: 0      # e.g., 128 + max(horizons)
   no_overlap: false     # if true, step becomes max(images.windows)
+
+training:
+  batch_size: 64
+  num_workers: 4
+  normalize: imagenet       # ou null
+  augment: false
+  prefer_days: true         # préfère d{N} si d{N} et h{N} coexistent
+  return_meta: true         # renvoie (x, y, meta) plutôt que (x, y)
+  balanced_sampler: false

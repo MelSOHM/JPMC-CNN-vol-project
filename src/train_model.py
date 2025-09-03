@@ -14,6 +14,7 @@ import time
 import json
 import random
 import numpy as np
+from contextlib import nullcontext
 # import datetime
 
 import torch
@@ -59,6 +60,52 @@ def pick_device(pref: str = "auto") -> torch.device:
         return torch.device("mps")
     return torch.device("cpu")
 
+def make_amp_ctx_and_scaler(device, use_amp: bool = True, allow_cpu_amp: bool = False):
+    """
+    Return (autocast_context, scaler) compatible with many PyTorch versions.
+    - CUDA: autocast + GradScaler
+    - CPU (optionnel): autocast si allow_cpu_amp=True
+    - MPS/others: pas d'autocast, pas de scaler (nullcontext)
+    """
+    devt = device.type  # 'cuda' | 'mps' | 'cpu'
+
+    # Pas d'AMP demandé
+    if not use_amp:
+        return nullcontext(), None
+
+    # ----- CUDA -----
+    if devt == "cuda":
+        # autocast
+        if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+            try:
+                ctx = torch.amp.autocast(device_type="cuda", enabled=True)
+            except TypeError:
+                ctx = torch.cuda.amp.autocast(enabled=True)
+        else:
+            ctx = torch.cuda.amp.autocast(enabled=True)
+        # scaler
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            try:
+                scaler = torch.amp.GradScaler()   # pas d'arg 'device_type' -> compat large
+            except TypeError:
+                scaler = torch.cuda.amp.GradScaler()
+        else:
+            scaler = torch.cuda.amp.GradScaler()
+        return ctx, scaler
+
+    # ----- CPU (optionnel) -----
+    if devt == "cpu" and allow_cpu_amp:
+        if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+            try:
+                ctx = torch.amp.autocast(device_type="cpu", enabled=True)
+            except TypeError:
+                ctx = nullcontext()
+        else:
+            ctx = nullcontext()
+        return ctx, None
+
+    # ----- MPS ou autre : PAS d'autocast -----
+    return nullcontext(), None
 # ---------------------------
 # Model builder
 # ---------------------------
@@ -123,30 +170,44 @@ def format_confusion(cm: dict, normalize: bool = False) -> str:
 # Train / evaluate loops
 # ---------------------------
 
-def run_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer=None,
-              device: torch.device = torch.device("cpu"), use_amp: bool = True):
+def run_epoch(model, loader, criterion, optimizer=None,
+              device=torch.device("cpu"), use_amp=True):
+    """
+    One epoch over `loader`.
+    - Train if `optimizer` is not None, else eval.
+    - Uses `make_amp_ctx_and_scaler(device, use_amp)` for AMP compat
+      across CUDA / MPS / CPU and PyTorch versions.
+    - Returns: (avg_loss, metrics_dict, confusion_dict)
+    """
     is_train = optimizer is not None
     model.train(is_train)
 
-    # AMP unifiée (comme on l’a déjà patché)
-    devt = device.type
-    use_autocast = use_amp and devt in ("cuda", "mps", "cpu")
-    scaler = torch.amp.GradScaler(device_type="cuda") if (use_amp and devt == "cuda") else None
-
+    # metrics accumulators
     total_loss = 0.0
     m_sum = {"acc": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
     n_batches = 0
     cm = {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
 
+    # Create a single scaler for the whole epoch (if CUDA+AMP).
+    # We'll create a fresh autocast context *per batch*.
+    _, scaler = make_amp_ctx_and_scaler(device, use_amp)
+
     for batch in loader:
-        xb, yb = (batch[0], batch[1]) if isinstance(batch, (list, tuple)) else batch
+        # support (x, y) or (x, y, meta)
+        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+            xb, yb = batch[0], batch[1]
+        else:
+            xb, yb = batch
+
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast(device_type=devt, enabled=use_autocast):
+        # fresh autocast context each iteration (compat new/old PyTorch)
+        ctx, _ = make_amp_ctx_and_scaler(device, use_amp)
+        with ctx:
             logits = model(xb)
             loss = criterion(logits, yb)
 
@@ -159,15 +220,16 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer=None,
                 loss.backward()
                 optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += float(loss.item())
         update_confusion_counts(logits.detach(), yb, cm)
         m = compute_metrics(logits.detach(), yb)
-        for k in m_sum: m_sum[k] += m[k]
+        for k in m_sum:
+            m_sum[k] += m[k]
         n_batches += 1
 
     avg_loss = total_loss / max(1, n_batches)
     metrics = {k: (m_sum[k] / max(1, n_batches)) for k in m_sum}
-    return avg_loss, metrics, cm   # <-- maintenant on renvoie aussi cm
+    return avg_loss, metrics, cm
 
 # ---------------------------
 # Checkpointing / early stopping

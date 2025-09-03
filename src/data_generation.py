@@ -2,7 +2,7 @@
 # build_dataset.py
 # Dataset builder: OHLCV -> GK vol -> labels (t+1/t+2)
 # Author: Mel & Daisy (JPMC project)
-
+from __future__ import annotations
 import argparse
 import math
 from pathlib import Path

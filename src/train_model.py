@@ -26,7 +26,7 @@ try:
 except ImportError as e:
     raise ImportError("PyYAML is required. Install with: pip install pyyaml") from e
 
-from torch_loader import make_dataloaders_from_yaml  
+from .torch_loader import make_dataloaders_from_yaml  
 
 # ---------------------------
 # Config helpers

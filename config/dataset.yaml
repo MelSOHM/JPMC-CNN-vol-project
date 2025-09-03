@@ -95,7 +95,7 @@ training:
   model: resnet18        # resnet18 | resnet50
   pretrained: true
   num_classes: 2
-  epochs: 1
+  epochs: 5
   batch_size: 64
   num_workers: 4
   lr: 1e-3

@@ -6,9 +6,8 @@ import pandas as pd
 
 import matplotlib.pyplot as plt
 
-import indicators
 from tqdm.auto import tqdm
-from indicators import *
+from .indicators import *
 
 # Kind : Heatmap 
 

@@ -15,10 +15,10 @@ import pandas as pd
 from PIL import Image
 import matplotlib.pyplot as plt
 
-import vol_smile_deseasonal as vol_smile
-import indicators
+from . import vol_smile_deseasonal as vol_smile
+from . import indicators
 from tqdm.auto import tqdm
-from image_generations import to_heatmap_image, to_recurrence_image, to_timeseries_image, to_gaf_image, compute_global_indicators
+from .image_generations import to_heatmap_image, to_recurrence_image, to_timeseries_image, to_gaf_image, compute_global_indicators
 
 
 # ---------------------------

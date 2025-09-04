@@ -122,6 +122,11 @@ def build_model(name: str, num_classes: int = 2, pretrained: bool = True) -> nn.
         in_feats = m.fc.in_features
         m.fc = nn.Linear(in_feats, num_classes)
         return m
+    if name == "inception_v3":
+        m = tvm.inception_v3(weights=tvm.Inception_V3_Weights.IMAGENET1K_V1 if pretrained else None, aux_logits=False)
+        in_feats = m.fc.in_features
+        m.fc = nn.Linear(in_feats, num_classes)
+        return m
     raise ValueError(f"Unknown model '{name}'. Supported: resnet18, resnet50")
 
 # ---------------------------

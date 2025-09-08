@@ -1,5 +1,6 @@
 # config.yaml
 data:
+  # csv: Data/multi_ticker/ADBE.csv
   csv: Data/apple/MBP_market.csv
   # csv: sub_data.csv
   symbol: AAPL
@@ -16,11 +17,11 @@ output:
 
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
-  train_end: 2025-08-15
-  val_end: 2025-08-20
+  train_end: 2024-12-09
+  val_end: 2025-04-09
 
 labels:
-  horizons: [1]  #Number of days
+  horizons: [2]  #Number of days
   median_window: 100
 
 deseasonalization:
@@ -30,7 +31,7 @@ deseasonalization:
 images: # Use 30min bucket / use only market data 
   encoder: ts_vol  # heatmap | ts_vol | ts_ohlc | recurrence | gaf
   windows: [26]
-  step: 26               # set to window size for no overlap
+  step: 26              # set to window size for no overlap
   ts_ma_window: 48
   size:
     width: 256

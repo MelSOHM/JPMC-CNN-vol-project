@@ -91,13 +91,13 @@ def merge_args_with_config(args) -> SimpleNamespace:
     out = args.out or get("output.dir")
     symbol = args.symbol or get("data.symbol")
     tz_utc = get("data.tz_utc", True)
-    time_col = args.time_col or get("data.time_col", None)
+    time_col = getattr(args, "time_col", None) or get("data.time_col", None)
     
     # resample
-    rs_rule   = get("data.resample.rule", None)
-    rs_label  = get("data.resample.label", "left")
-    rs_closed = get("data.resample.closed", "left")
-    rs_dropna = get("data.resample.drop_na", True)
+    rs_rule    = get("data.resample.rule", None) or getattr(args, "rs_rule", None)
+    rs_label   = getattr(args, "rs_label", None)   or get("data.resample.label", "left")
+    rs_closed  = getattr(args, "rs_closed", None)  or get("data.resample.closed", "left")
+    rs_dropna  = get("data.resample.drop_na", True) if getattr(args, "rs_dropna", None) is None else getattr(args, "rs_dropna")
 
     train_end = args.train_end or get("splits.train_end")
     val_end   = args.val_end or get("splits.val_end")
@@ -146,8 +146,8 @@ def merge_args_with_config(args) -> SimpleNamespace:
     rsi_source  = get("images.ts_overlays.bottom.rsi_source", "vol")  # 'vol' or 'close'
 
     # --- style (shared) ---
-    fg = get("images.style.fg", "white")
-    bg = get("images.style.bg", "black")
+    fg = get("images.ts_overlays.style.fg", "white")
+    bg = get("images.ts_overlays.style.bg", "black")
     
     # --- Reccurence Plot ---
     rp_series        = get("images.recurrence.series", "vol")
@@ -534,10 +534,10 @@ def build_dataset(csv_path: Path,
         csv_path,
         tz_utc=m.tz_utc if "m" in globals() else True,   # si tu appelles avec m; sinon passe les args reçus
         time_col=m.time_col if "m" in globals() else None,
-        rs_rule=m.rs_rule,
-        rs_label=m.rs_label,
-        rs_closed=m.rs_closed,
-        rs_dropna=m.rs_dropna,
+        rs_rule=rs_rule,
+        rs_label=rs_label,
+        rs_closed=rs_closed,
+        rs_dropna=rs_dropna,
     )
     _freq_info(df.index)
     ohlcv = df[["open","high","low","close"] + ([ "volume"] if "volume" in df.columns else [])].copy()
@@ -783,6 +783,7 @@ if __name__ == "__main__":
                 image_encoder=m.image_encoder,
                 ts_ma_window=m.ts_ma_window,
                 img_w=m.img_w, img_h=m.img_h, img_dpi=m.img_dpi,
+                rs_rule=m.rs_rule, rs_label=m.rs_label, rs_closed=m.rs_closed, rs_dropna=m.rs_dropna,
                 align_enabled=m.align_enabled,
                 align_time_str=m.align_time_str,
                 align_tz=m.align_tz,

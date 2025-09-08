@@ -209,5 +209,5 @@ __marimo__/
 .DS_Store
 *.ipynb
 dataset*/
-Data/apple/
+Data/
 runs/

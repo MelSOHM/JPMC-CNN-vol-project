@@ -221,7 +221,11 @@ def make_dataloaders_from_yaml(cfg_path: Union[str, Path]) -> Dict[str, DataLoad
     cfg_path = Path(cfg_path)
     cfg = yaml.safe_load(cfg_path.read_text()) or {}
 
-    root = Path(_get(cfg, "output.dir", "./dataset_out")).resolve()
+    batch = _get(cfg, "output.batch_dir", None)
+    if batch:
+        root = batch
+    else:
+        root = Path(_get(cfg, "output.dir", "./dataset_out")).resolve()
     if not root.exists():
         raise FileNotFoundError(f"output.dir not found: {root}")
 

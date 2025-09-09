@@ -528,6 +528,7 @@ def build_dataset(csv_path: Path,
                   gaf_normalize: str = "minmax",     # 'minmax' | 'zscore' | 'none'
                   gaf_cmap: str = "viridis",
                   gaf_invert: bool = False,
+                  out_path_batch: str = None
                   ) -> None:
 
     df = load_ohlcv(
@@ -617,7 +618,7 @@ def build_dataset(csv_path: Path,
                     end_ts = idx[-1]
                     y = int(part_df.loc[end_ts, f"y_h{h}"])
                     fname = ts_to_filename(end_ts)
-                    out_path = out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
+                    out_path = Path(out_path_batch) / f"y{y}" / f"{fname}.png" if out_path_batch else out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
 
                     if image_encoder == "heatmap":
                         # features simples pour heatmap

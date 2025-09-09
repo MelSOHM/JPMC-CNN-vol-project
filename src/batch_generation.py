@@ -172,6 +172,7 @@ def main():
             gaf_normalize=m.gaf_normalize,
             gaf_cmap=m.gaf_cmap,
             gaf_invert=m.gaf_invert,
+            out_path_batch='dataset_out_ts/all_ticker'
         )
 
     print("[DONE] all symbols processed.")

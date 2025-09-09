@@ -1,9 +1,9 @@
 # config.yaml
 data:
-  # csv: Data/multi_ticker/ADBE.csv
-  csv: Data/apple/MBP_market.csv
+  csv: Data/multi_ticker/AMAT.csv
+  # csv: Data/apple/MBP_market.csv
   # csv: sub_data.csv
-  symbol: AAPL
+  symbol: AMAT
   tz_utc: true
   time_col: ts_event 
   resample:
@@ -30,8 +30,8 @@ deseasonalization:
 
 images: # Use 30min bucket / use only market data 
   encoder: ts_vol  # heatmap | ts_vol | ts_ohlc | recurrence | gaf
-  windows: [26]
-  step: 26              # set to window size for no overlap
+  windows: [260]
+  step: 260              # set to window size for no overlap
   ts_ma_window: 48
   size:
     width: 256

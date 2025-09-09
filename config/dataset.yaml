@@ -14,7 +14,7 @@ data:
 
 output:
   dir: ./dataset_out_ts
-
+  batch_dir: ./dataset_out_ts/all_tickerzzz #only activate when working with several ticker
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
   train_end: 2024-12-09
@@ -30,8 +30,8 @@ deseasonalization:
 
 images: # Use 30min bucket / use only market data 
   encoder: ts_vol  # heatmap | ts_vol | ts_ohlc | recurrence | gaf
-  windows: [260]
-  step: 260              # set to window size for no overlap
+  windows: [26]
+  step: 26              # set to window size for no overlap
   ts_ma_window: 48
   size:
     width: 256

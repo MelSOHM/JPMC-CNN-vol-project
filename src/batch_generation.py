@@ -46,7 +46,7 @@ def main():
             csv=str(csv_path),
             symbol=symbol,
             out=None,  # None -> prendra output.dir du YAML
-
+            
             # --- tout le reste à None : le YAML fournit les valeurs ---
             # data / resample
             time_col=None, symbol_col=None, symbols=None, tz_utc=None,
@@ -172,7 +172,7 @@ def main():
             gaf_normalize=m.gaf_normalize,
             gaf_cmap=m.gaf_cmap,
             gaf_invert=m.gaf_invert,
-            out_path_batch='dataset_out_ts/all_ticker'
+            out_path_batch=m.batch_out
         )
 
     print("[DONE] all symbols processed.")

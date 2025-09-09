@@ -89,6 +89,7 @@ def merge_args_with_config(args) -> SimpleNamespace:
     # Base (CLI wins over YAML)
     csv = args.csv or get("data.csv")
     out = args.out or get("output.dir")
+    batch_out = get("output.batch_dir", None)
     symbol = args.symbol or get("data.symbol")
     tz_utc = get("data.tz_utc", True)
     time_col = getattr(args, "time_col", None) or get("data.time_col", None)
@@ -182,7 +183,7 @@ def merge_args_with_config(args) -> SimpleNamespace:
         raise ValueError("Missing required config: " + ", ".join(missing))
 
     return SimpleNamespace(
-        csv=csv, out=out, symbol=symbol, tz_utc=tz_utc, time_col=time_col,
+        csv=csv, out=out, batch_out=batch_out, symbol=symbol, tz_utc=tz_utc, time_col=time_col,
         rs_rule=rs_rule, rs_label=rs_label, rs_closed=rs_closed, rs_dropna=rs_dropna,
         train_end=train_end, val_end=val_end,
         horizons=horizons, median_window=median_window,

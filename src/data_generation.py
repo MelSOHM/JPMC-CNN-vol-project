@@ -107,6 +107,7 @@ def merge_args_with_config(args) -> SimpleNamespace:
 
     horizons = args.horizons or get("labels.horizons", [1, 2])
     median_window = args.median_window if args.median_window is not None else get("labels.median_window", 100)
+    label_mode = get("labels.mode", "standard")
 
     deseason_mode = args.deseason_mode or get("deseasonalization.mode", "none")
     deseason_bucket = args.deseason_bucket or get("deseasonalization.bucket", "minute")
@@ -188,7 +189,7 @@ def merge_args_with_config(args) -> SimpleNamespace:
         csv=csv, out=out, batch_out=batch_out, symbol=symbol, tz_utc=tz_utc, time_col=time_col,
         rs_rule=rs_rule, rs_label=rs_label, rs_closed=rs_closed, rs_dropna=rs_dropna,
         train_end=train_end, val_end=val_end,
-        horizons=horizons, median_window=median_window,
+        horizons=horizons, median_window=median_window, label_mode=label_mode,
         deseason_mode=deseason_mode, deseason_bucket=deseason_bucket,
         image_encoder=image_encoder, image_windows=image_windows, image_step=image_step,
         align_enabled=align_enabled, align_time_str=align_time_str, align_tz=align_tz,
@@ -376,6 +377,125 @@ def make_labels(vol: pd.Series,
         out = out.dropna()
     return out
 
+def make_labels_overnight(ohlcv: pd.DataFrame,
+                         median_window: int = 100,
+                         exclude_weekends: bool = True,
+                         market_tz: str = "America/New_York") -> pd.DataFrame:
+    """
+    Build ex-ante binary labels for overnight volatility prediction:
+      y_t = 1{ overnight_vol_{t+1_open} > median_hist_t },
+    where overnight_vol = |log(Open_{t+1}) - log(Close_t)| and median_hist_t 
+    is the rolling historical median of overnight_vol up to t-1.
+    
+    Args:
+        ohlcv: DataFrame with OHLC columns and DatetimeIndex
+        median_window: window for rolling median (in sessions, not bars)
+        exclude_weekends: if True, exclude Friday->Monday gaps
+        market_tz: timezone for market hours (default: America/New_York)
+    
+    Returns:
+        DataFrame with columns: close_ts, overnight_vol, median_hist, y_h1
+        Indexed by the close timestamps (day t)
+    """
+    if not all(col in ohlcv.columns for col in ["open", "high", "low", "close"]):
+        raise ValueError("OHLCV must contain 'open', 'high', 'low', 'close' columns")
+    
+    # Convert to market timezone for reliable session identification
+    df_market = ohlcv.copy()
+    if df_market.index.tz is None:
+        df_market.index = df_market.index.tz_localize("UTC")
+    df_market.index = df_market.index.tz_convert(market_tz)
+    
+    # Find session close (16:00) and next session open (09:30)
+    session_closes = []
+    session_opens = []
+    
+    # Group by date and find 16:00 close and 09:30 open
+    for date, day_data in df_market.groupby(df_market.index.date):
+        # Find 16:00 close (last bar of the day, or closest to 16:00)
+        close_candidates = day_data[day_data.index.time >= pd.Timestamp("16:00").time()]
+        if not close_candidates.empty:
+            close_ts = close_candidates.index[-1]  # last bar >= 16:00
+            session_closes.append((close_ts, day_data.loc[close_ts, "close"]))
+        
+        # Find 09:30 open (first bar of the day, or closest to 09:30)
+        open_candidates = day_data[day_data.index.time <= pd.Timestamp("09:30").time()]
+        if not open_candidates.empty:
+            open_ts = open_candidates.index[0]  # first bar <= 09:30
+            session_opens.append((open_ts, day_data.loc[open_ts, "open"]))
+    
+    if not session_closes or not session_opens:
+        raise ValueError("Could not find valid session closes/opens")
+    
+    # Create DataFrames for closes and opens
+    closes_df = pd.DataFrame(session_closes, columns=["timestamp", "close_price"])
+    opens_df = pd.DataFrame(session_opens, columns=["timestamp", "open_price"])
+    closes_df.set_index("timestamp", inplace=True)
+    opens_df.set_index("timestamp", inplace=True)
+    
+    # Map each close to the next business day's open
+    overnight_pairs = []
+    for close_ts, close_price in closes_df.itertuples():
+        close_date = close_ts.date()
+        
+        # Find next business day's open
+        next_opens = opens_df[opens_df.index.date > close_date]
+        if next_opens.empty:
+            continue
+            
+        next_open_ts = next_opens.index[0]
+        next_open_date = next_open_ts.date()
+        next_open_price = next_opens.loc[next_open_ts, "open_price"]
+        
+        # Exclude weekend gaps (Friday -> Monday) if requested
+        if exclude_weekends:
+            days_gap = (next_open_date - close_date).days
+            if days_gap > 1:  # More than 1 day gap (weekend/holiday)
+                continue
+        
+        # Calculate overnight volatility: |log(open) - log(close)|
+        overnight_vol = abs(np.log(next_open_price) - np.log(close_price))
+        
+        overnight_pairs.append({
+            "close_ts": close_ts,
+            "next_open_ts": next_open_ts,
+            "close_price": close_price,
+            "next_open_price": next_open_price,
+            "overnight_vol": overnight_vol
+        })
+    
+    if not overnight_pairs:
+        raise ValueError("No valid overnight pairs found")
+    
+    # Create DataFrame with overnight volatilities
+    overnight_df = pd.DataFrame(overnight_pairs)
+    overnight_df.set_index("close_ts", inplace=True)
+    overnight_df = overnight_df.sort_index()
+    
+    # Calculate rolling median of historical overnight volatilities (no look-ahead)
+    overnight_vol_series = overnight_df["overnight_vol"]
+    median_hist = overnight_vol_series.shift(1).rolling(window=median_window, min_periods=median_window).median()
+    
+    # Create binary labels: 1 if overnight_vol > median_hist
+    y = (overnight_vol_series > median_hist).astype("float").rename("y_h1")
+    
+    # Combine results
+    result = pd.concat({
+        "overnight_vol": overnight_vol_series,
+        "median_hist": median_hist,
+        "y_h1": y
+    }, axis=1)
+    
+    # Add metadata
+    result["next_open_ts"] = overnight_df["next_open_ts"]
+    result["close_price"] = overnight_df["close_price"]
+    result["next_open_price"] = overnight_df["next_open_price"]
+    
+    # Drop rows with NaN (insufficient history for median)
+    result = result.dropna()
+    
+    return result
+
 # -------------------------------------------------
 # 4) (train/val/test) temporal split 
 # -------------------------------------------------
@@ -542,7 +662,8 @@ def build_dataset(csv_path: Path,
                   gaf_normalize: str = "minmax",     # 'minmax' | 'zscore' | 'none'
                   gaf_cmap: str = "viridis",
                   gaf_invert: bool = False,
-                  out_path_batch: str = None
+                  out_path_batch: str = None,
+                  label_mode: str = "standard"       # "standard" | "overnight_gap"
                   ) -> None:
 
     df = load_ohlcv(
@@ -586,59 +707,159 @@ def build_dataset(csv_path: Path,
     )
    
     meta_all = []
-    for h in horizon_list:
-        if h == 0:
-            lab = make_labels_in_sample(vol_src, median_window=image_windows[0], drop_na=True)
-            print('## [LABEL GENERATION IN SAMPLE] ##')
-        else:
-            
-            lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
-        #lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
-        lab["symbol"] = symbol
-        lab["horizon"] = h
+    
+    # Handle different labeling modes
+    if label_mode == "overnight_gap":
+        # For overnight mode, we only use horizon=1 (overnight gap)
+        if 1 not in horizon_list:
+            print(f"[WARNING] overnight_gap mode requires horizon=1, but got {horizon_list}. Using horizon=1.")
+            horizon_list = [1]
         
-        # Temporal split
-        if splits is not None:
-            train_end = pd.to_datetime(splits[0], utc=True)
-            val_end = pd.to_datetime(splits[1], utc=True) if splits[1] else None
-            train, val, test = time_split(lab, train_end, val_end)
-            parts = [("train", train), ("val", val), ("test", test)]
-        else:
-            parts = [("full", lab)]
-            
-        if align_enabled:
-            aligned_parts = []
-            for split_name, part_df in parts:
-                if part_df.empty:
-                    aligned_parts.append((split_name, part_df))
-                    continue
-                part_aligned, anchor_ts = realign_to_day_anchor(
-                    part_df, anchor_time=align_time_str, anchor_tz=align_tz
-                )
-                kept = len(part_aligned); drop = len(part_df) - kept
-                print(f"[ALIGN] split={split_name} anchor={align_time_str} {align_tz} "
-                    f"dropped={drop} kept={kept} first={anchor_ts}")
-                aligned_parts.append((split_name, part_aligned))
-            parts = aligned_parts
+        # Generate overnight labels
+        lab = make_labels_overnight(ohlcv, median_window=median_window, exclude_weekends=True)
+        lab["symbol"] = symbol
+        lab["horizon"] = 1  # Always 1 for overnight gap
+        
+        # For overnight mode, we need to align images to session close times
+        # The labels are indexed by close timestamps, so we need to create images
+        # that end at those close times and cover the full session (09:30-16:00)
+        
+    else:
+        # Standard mode: use the original make_labels function
+        for h in horizon_list:
+            lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
+            lab["symbol"] = symbol
+            lab["horizon"] = h
 
-        # Images
-        if image_windows:
-            for split_name, part_df in parts:
-                if part_df.empty:
-                    continue            
-                idx_pairs = window_indices(len(part_df), win=max(image_windows), step=image_step)
-                for (a, b) in tqdm(
-                    idx_pairs,
-                    desc=f"Generating {image_encoder} images | {symbol} | {split_name} | horizon={h}d",
-                    total=len(idx_pairs),
+    # Temporal split (applies to both modes)
+    if splits is not None:
+        train_end = pd.to_datetime(splits[0], utc=True)
+        val_end = pd.to_datetime(splits[1], utc=True) if splits[1] else None
+        train, val, test = time_split(lab, train_end, val_end)
+        parts = [("train", train), ("val", val), ("test", test)]
+    else:
+        parts = [("full", lab)]
+            
+    if align_enabled:
+        aligned_parts = []
+        for split_name, part_df in parts:
+            if part_df.empty:
+                aligned_parts.append((split_name, part_df))
+                continue
+            part_aligned, anchor_ts = realign_to_day_anchor(
+                part_df, anchor_time=align_time_str, anchor_tz=align_tz
+            )
+            kept = len(part_aligned); drop = len(part_df) - kept
+            print(f"[ALIGN] split={split_name} anchor={align_time_str} {align_tz} "
+                f"dropped={drop} kept={kept} first={anchor_ts}")
+            aligned_parts.append((split_name, part_aligned))
+        parts = aligned_parts
+
+    # Images
+    if image_windows:
+        for split_name, part_df in parts:
+            if part_df.empty:
+                continue
+                
+            if label_mode == "overnight_gap":
+                # For overnight mode, create one image per close timestamp
+                # Each image covers the full session ending at that close time
+                for close_ts in tqdm(
+                    part_df.index,
+                    desc=f"Generating {image_encoder} images | {symbol} | {split_name} | overnight",
                     dynamic_ncols=True,
                     leave=False
                 ):
-                    idx = part_df.index[a:b]
-                    end_ts = idx[-1]
-                    y = int(part_df.loc[end_ts, f"y_h{h}"])
-                    fname = ts_to_filename(end_ts)
-                    out_path = Path(out_path_batch) / split_name / f"h{h}" / f"y{y}" / f"{fname}_{symbol}.png" if out_path_batch else out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
+                    # Find the session window ending at this close time
+                    # Convert to market timezone to find session boundaries
+                    if ohlcv.index.tz is None:
+                        ohlcv_tz = ohlcv.index.tz_localize("UTC")
+                    else:
+                        ohlcv_tz = ohlcv.index.tz_convert("America/New_York")
+                    
+                    close_ts_market = close_ts.tz_convert("America/New_York")
+                    session_date = close_ts_market.date()
+                    
+                    # Find session start (09:30) and end (16:00) for this date
+                    session_start = pd.Timestamp(f"{session_date} 09:30", tz="America/New_York")
+                    session_end = pd.Timestamp(f"{session_date} 16:00", tz="America/New_York")
+                    
+                    # Convert back to original timezone for indexing
+                    if ohlcv.index.tz is None:
+                        session_start = session_start.tz_convert("UTC").tz_localize(None)
+                        session_end = session_end.tz_convert("UTC").tz_localize(None)
+                    else:
+                        session_start = session_start.tz_convert(ohlcv.index.tz)
+                        session_end = session_end.tz_convert(ohlcv.index.tz)
+                    
+                    # Get session data
+                    session_data = ohlcv.loc[session_start:session_end]
+                    if len(session_data) < 10:  # Need minimum bars for a meaningful image
+                        continue
+                    
+                    y = int(part_df.loc[close_ts, "y_h1"])
+                    fname = ts_to_filename(close_ts)
+                    out_path = Path(out_path_batch) / f"y{y}" / f"{fname}.png" if out_path_batch else out_dir / symbol / split_name / f"h1" / f"y{y}" / f"{fname}.png"
+                    
+                    # Generate image for this session
+                    if image_encoder == "ts_ohlc":
+                        to_timeseries_image(session_data, out_path, kind="ohlc",
+                                          ma_window=ts_ma_window,
+                                          width_px=img_w, height_px=img_h, dpi=img_dpi)
+                    elif image_encoder == "ts_vol":
+                        # For ts_vol, we need to compute volatility for the session
+                        session_vol = garman_klass_sigma(session_data)
+                        session_vol_df = pd.DataFrame(index=session_data.index)
+                        session_vol_df["vol"] = session_vol
+                        if "volume" in session_data.columns:
+                            session_vol_df["volume"] = session_data["volume"]
+                        
+                        # Get precomputed indicators for this session
+                        session_ind = ind.loc[session_data.index]
+                        
+                        to_timeseries_image(
+                            session_vol_df, out_path, kind="vol", vol_col="vol",
+                            ma_window=ts_ma_window,
+                            # overlays
+                            show_ma_top=show_ma_top,
+                            show_bbands=bb_enabled,
+                            bb_window=bb_window, bb_nstd=bb_nstd,
+                            bottom_panel=bottom_panel, rsi_window=rsi_window,
+                            # day separators
+                            show_day_separators=day_sep_enabled,
+                            day_sep_label=day_sep_label,
+                            day_sep_color=day_sep_color,
+                            day_sep_alpha=day_sep_alpha,
+                            day_sep_lw=day_sep_lw,
+                            day_label_kind=day_label_kind,
+                            # provide precomputed series
+                            ma_series=session_ind["vol_ma"],
+                            bb_up_series=session_ind["bb_up"],
+                            bb_lo_series=session_ind["bb_lo"],
+                            rsi_series=session_ind["rsi"] if bottom_panel == "rsi" else None,
+                            # style/size
+                            fg=fg, bg=bg, width_px=img_w, height_px=img_h, dpi=img_dpi
+                        )
+                    else:
+                        print(f"[WARNING] overnight_gap mode supports ts_ohlc and ts_vol encoders, got {image_encoder}")
+                        continue
+                        
+            else:
+                # Standard mode: use window indices
+                for h in horizon_list:
+                    idx_pairs = window_indices(len(part_df), win=max(image_windows), step=image_step)
+                    for (a, b) in tqdm(
+                        idx_pairs,
+                        desc=f"Generating {image_encoder} images | {symbol} | {split_name} | horizon={h}d",
+                        total=len(idx_pairs),
+                        dynamic_ncols=True,
+                        leave=False
+                    ):
+                        idx = part_df.index[a:b]
+                        end_ts = idx[-1]
+                        y = int(part_df.loc[end_ts, f"y_h{h}"])
+                        fname = ts_to_filename(end_ts)
+                        out_path = Path(out_path_batch) / f"y{y}" / f"{fname}.png" if out_path_batch else out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
 
                     if image_encoder == "heatmap":
                         # features simples pour heatmap
@@ -833,4 +1054,5 @@ if __name__ == "__main__":
                 gaf_normalize=m.gaf_normalize,
                 gaf_cmap=m.gaf_cmap,
                 gaf_invert=m.gaf_invert,
+                label_mode=m.label_mode,
             )

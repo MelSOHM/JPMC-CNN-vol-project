@@ -453,8 +453,8 @@ def make_labels_overnight(ohlcv: pd.DataFrame,
             if days_gap > 1:  # More than 1 day gap (weekend/holiday)
                 continue
         
-        # Calculate overnight volatility: |log(open) - log(close)|
-        overnight_vol = abs(np.log(next_open_price) - np.log(close_price))
+        # Calculate overnight squared return: (log(open) - log(close))^2
+        overnight_vol = (np.log(next_open_price) - np.log(close_price)) ** 2
         
         overnight_pairs.append({
             "close_ts": close_ts,

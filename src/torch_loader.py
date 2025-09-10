@@ -223,7 +223,7 @@ def make_dataloaders_from_yaml(cfg_path: Union[str, Path]) -> Dict[str, DataLoad
 
     batch = _get(cfg, "output.batch_dir", None)
     if batch:
-        root = batch
+        root = Path(batch)
     else:
         root = Path(_get(cfg, "output.dir", "./dataset_out")).resolve()
     if not root.exists():
@@ -259,6 +259,7 @@ def make_dataloaders_from_yaml(cfg_path: Union[str, Path]) -> Dict[str, DataLoad
 
     # scan disk
     all_samples = scan_images(root, symbols, ("train", "val", "test"), horizons, prefer_days)
+    print(all_samples)
     by_split: Dict[str, List[ImgSample]] = {"train": [], "val": [], "test": []}
     for s in all_samples: by_split[s.split].append(s)
 

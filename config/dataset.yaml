@@ -1,9 +1,9 @@
 # config.yaml
 data:
-  csv: Data/multi_ticker/AMAT.csv
+  csv: Data/multi_ticker/AMAT.csv #input
   # csv: Data/apple/MBP_market.csv
   # csv: sub_data.csv
-  symbol: all_tickerzzz
+  symbol: batch # put batch when working with several symbols 
   tz_utc: true
   time_col: ts_event 
   resample:
@@ -14,7 +14,7 @@ data:
 
 output:
   dir: ./dataset_out_ts
-  batch_dir: ./dataset_out_ts #only activate when working with several ticker
+  batch_dir: ./dataset_out_ts/all_tickerzzz #only activate when working with several ticker
 
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.

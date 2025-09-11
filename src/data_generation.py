@@ -409,19 +409,18 @@ def make_labels_overnight(ohlcv: pd.DataFrame,
     # Find session close (16:00) and next session open (09:30)
     session_closes = []
     session_opens = []
-    
     # Group by date and find 16:00 close and 09:30 open
     for date, day_data in df_market.groupby(df_market.index.date):
-        # Find 16:00 close (last bar of the day, or closest to 16:00)
-        close_candidates = day_data[day_data.index.time >= pd.Timestamp("16:00").time()]
+        # Find 16:00 close (last bar at or before 16:00)
+        close_candidates = day_data[day_data.index.time <= pd.Timestamp("16:00").time()]
         if not close_candidates.empty:
-            close_ts = close_candidates.index[-1]  # last bar >= 16:00
+            close_ts = close_candidates.index[-1]  # last bar <= 16:00
             session_closes.append((close_ts, day_data.loc[close_ts, "close"]))
         
-        # Find 09:30 open (first bar of the day, or closest to 09:30)
-        open_candidates = day_data[day_data.index.time <= pd.Timestamp("09:30").time()]
+        # Find 09:30 open (first bar at or after 09:30)
+        open_candidates = day_data[day_data.index.time >= pd.Timestamp("09:30").time()]
         if not open_candidates.empty:
-            open_ts = open_candidates.index[0]  # first bar <= 09:30
+            open_ts = open_candidates.index[0]  # first bar >= 09:30
             session_opens.append((open_ts, day_data.loc[open_ts, "open"]))
     
     if not session_closes or not session_opens:
@@ -962,7 +961,8 @@ def build_dataset(csv_path: Path,
             for split_name, part_df in parts:
                 if part_df.empty:
                     continue
-                out_csv = out_dir / symbol / split_name / f"labels_h{h}.csv"
+                out_csv = out_dir / symbol / split_name / f"labels_h{part_df['horizon'].iloc[0]}.csv"
+                print(out_csv, "out csv")
                 out_csv.parent.mkdir(parents=True, exist_ok=True)
                 part_df.to_csv(out_csv)
 

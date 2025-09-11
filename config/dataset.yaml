@@ -22,7 +22,7 @@ splits:
   val_end: 2025-04-09
 
 labels:
-  horizons: [0]  #Number of days (0.5 for in sample tests)
+  horizons: [1]  #Number of days (0.5 for in sample tests)
   in_sample: false
   median_window: 100
   mode: overnight_gap

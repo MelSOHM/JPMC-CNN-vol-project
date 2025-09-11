@@ -1,7 +1,7 @@
 # config.yaml
 data:
-  csv: Data/multi_ticker/AMAT.csv #input
-  # csv: Data/apple/MBP_market.csv
+  # csv: Data/multi_ticker/AMAT.csv #input
+  csv: Data/apple/MBP_market.csv
   # csv: sub_data.csv
   symbol: batch # put batch when working with several symbols 
   tz_utc: true
@@ -22,8 +22,8 @@ splits:
   val_end: 2025-04-09
 
 labels:
-  horizons: [2]  #Number of days
-  median_window: 100
+  horizons: [1]  #Number of days
+  median_window: 20
   mode: overnight_gap
 
 deseasonalization:

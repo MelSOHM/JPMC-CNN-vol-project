@@ -101,7 +101,8 @@ training:
   batch_size: 64
   num_workers: 4
   lr: 1e-3
-  weight_decay: 1e-4
+  weight_decay: 1e-3
+  dropout: 0.5           # dropout rate for final layer
   optimizer: adamw       # adamw | sgd
   scheduler: cosine      # none | cosine | step
   step_size: 10          # (if scheduler=step)
@@ -111,10 +112,10 @@ training:
   patience: 7
   save_dir: runs/exp1
   normalize: imagenet    # imagenet | null
-  augment: false
+  augment: true
   prefer_days: true
   return_meta: true
   balanced_sampler: false
-  class_weights: false   # if true: Weight cross entropy by inverse frequency
+  class_weights: true    # if true: Weight cross entropy by inverse frequency
   show_confusion: true      # false to desactivate
   normalize_confusion: false  # true ro display in proportions

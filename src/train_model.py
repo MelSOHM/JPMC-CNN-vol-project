@@ -110,22 +110,31 @@ def make_amp_ctx_and_scaler(device, use_amp: bool = True, allow_cpu_amp: bool = 
 # Model builder
 # ---------------------------
 
-def build_model(name: str, num_classes: int = 2, pretrained: bool = True) -> nn.Module:
+def build_model(name: str, num_classes: int = 2, pretrained: bool = True, dropout: float = 0.5) -> nn.Module:
     name = (name or "resnet18").lower()
     if name == "resnet18":
         m = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
         in_feats = m.fc.in_features
-        m.fc = nn.Linear(in_feats, num_classes)
+        m.fc = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(in_feats, num_classes)
+        )
         return m
     if name == "resnet50":
         m = tvm.resnet50(weights=tvm.ResNet50_Weights.IMAGENET1K_V2 if pretrained else None)
         in_feats = m.fc.in_features
-        m.fc = nn.Linear(in_feats, num_classes)
+        m.fc = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(in_feats, num_classes)
+        )
         return m
     if name == "inception_v3":
         m = tvm.inception_v3(weights=tvm.Inception_V3_Weights.IMAGENET1K_V1 if pretrained else None, aux_logits=False)
         in_feats = m.fc.in_features
-        m.fc = nn.Linear(in_feats, num_classes)
+        m.fc = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(in_feats, num_classes)
+        )
         return m
     raise ValueError(f"Unknown model '{name}'. Supported: resnet18, resnet50")
 
@@ -278,7 +287,8 @@ def main():
     model_name = _get(cfg, "training.model", "resnet18")
     pretrained = bool(_get(cfg, "training.pretrained", True))
     num_classes = int(_get(cfg, "training.num_classes", 2))
-    model = build_model(model_name, num_classes=num_classes, pretrained=pretrained).to(device)
+    dropout = float(_get(cfg, "training.dropout", 0.5))
+    model = build_model(model_name, num_classes=num_classes, pretrained=pretrained, dropout=dropout).to(device)
 
     # Loss (class weights optional)
     use_class_weights = bool(_get(cfg, "training.class_weights", False))

@@ -11,6 +11,7 @@ import re
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import BusinessDay
 
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -19,7 +20,7 @@ from . import vol_smile_deseasonal as vol_smile
 from . import indicators
 from tqdm.auto import tqdm
 from .image_generations import to_heatmap_image, to_recurrence_image, to_timeseries_image, to_gaf_image, compute_global_indicators
-
+from .qa_data import count_missing_minutes_fixed_window
 
 # ---------------------------
 # 1) Loading & Prep
@@ -127,7 +128,7 @@ def merge_args_with_config(args) -> SimpleNamespace:
     heatmap_cmap = get("images.heatmap.cmap", "viridis")
     heatmap_vmin = get("images.heatmap.vmin", None)
     heatmap_vmax = get("images.heatmap.vmax", None)
-    
+
     # --- Day separator (ts_vol) ---
     day_sep_enabled = get("images.ts_overlays.day_separators.enabled", False)
     day_sep_label   = get("images.ts_overlays.day_separators.label", True)
@@ -247,7 +248,6 @@ def load_ohlcv(csv_path: Path,
 
     df[time_col] = pd.to_datetime(df[time_col], utc=tz_utc, errors="coerce")
     df = df.dropna(subset=[time_col]).sort_values(time_col).set_index(time_col)
-
     req = {"open", "high", "low", "close"}
     miss = req - set(df.columns)
     if miss:
@@ -255,7 +255,6 @@ def load_ohlcv(csv_path: Path,
 
     if rs_rule:
         df = resample_ohlcv(df, rs_rule, label=rs_label, closed=rs_closed, drop_na=rs_dropna)
-
     return df
 
 def resample_ohlcv(df: pd.DataFrame,
@@ -327,12 +326,11 @@ def lookahead_by_days(s: pd.Series, days: int) -> pd.Series:
     timestamp >= (t + days). Works with tz-aware DatetimeIndex and irregular grids.
     """
     if not isinstance(s.index, pd.DatetimeIndex):
-        raise TypeError("lookahead_by_days expects a DatetimeIndex")
+        raise TypeError("lookahead_by_bdays expects a DatetimeIndex")
     idx = s.index
-    target = idx + pd.Timedelta(days=days)
-    # position of first index >= target (bfill on indexer)
+    target = idx + BusinessDay(days)
     pos = idx.get_indexer(target, method="bfill")
-    out = pd.Series(np.nan, index=idx, name=f"{s.name}_tplus_{days}D")
+    out = pd.Series(np.nan, index=idx, name=f"{s.name}_tplus_{days}B")
     ok = pos != -1
     if ok.any():
         vals = s.to_numpy()
@@ -345,15 +343,15 @@ def make_labels(vol: pd.Series,
                 drop_na: bool = True) -> pd.DataFrame:
     """
     Build ex-ante binary labels using a *calendar-day* horizon:
-      y_t = 1{ vol_{first ts >= t + horizon_days} > median_hist_t },
+    y_t = 1{ vol_{first ts >= t + horizon_days} > median_hist_t },
     where median_hist_t is the rolling historical median up to t-1.
     Notes:
-      - horizon measured in days (calendar).
-      - if no future timestamp exists, label is NaN and will be dropped.
+    - horizon measured in days (calendar).
+    - if no future timestamp exists, label is NaN and will be dropped.
     """
     # historical median (no look-ahead at t)
     med = rolling_median_ex_ante(vol, window=median_window).rename("median_hist")
-
+    
     # future vol at first timestamp >= t + horizon_days
     vfut = lookahead_by_days(vol, horizon_days).rename(f"vol_tplus_{horizon_days}D")
 
@@ -571,7 +569,7 @@ def build_dataset(csv_path: Path,
         rsi_window=rsi_window,   # ← depuis YAML (images.ts_overlays.bottom.rsi_window)
         rsi_source=rsi_source,   # ← depuis YAML (vol|close)
     )
-
+   
     meta_all = []
     for h in horizon_list:
         lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
@@ -606,7 +604,7 @@ def build_dataset(csv_path: Path,
         if image_windows:
             for split_name, part_df in parts:
                 if part_df.empty:
-                    continue
+                    continue            
                 idx_pairs = window_indices(len(part_df), win=max(image_windows), step=image_step)
                 for (a, b) in tqdm(
                     idx_pairs,
@@ -688,7 +686,7 @@ def build_dataset(csv_path: Path,
                             continue
 
                         fname = ts_to_filename(end_ts)
-                        out_path = out_dir / symbol / split_name / f"d{h}" / f"y{y}" / f"{fname}.png"
+                        out_path = Path(out_path_batch) / split_name / f"h{h}" / f"y{y}" / f"{fname}.png" if out_path_batch else out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
 
                         to_recurrence_image(
                             s, out_path,
@@ -708,7 +706,7 @@ def build_dataset(csv_path: Path,
                         if s.isna().any():
                             continue
                         fname = ts_to_filename(end_ts)
-                        out_path = out_dir / symbol / split_name / f"d{h}" / f"y{y}" / f"{fname}.png"
+                        out_path = Path(out_path_batch) / split_name / f"h{h}" / f"y{y}" / f"{fname}.png" if out_path_batch else out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
                         to_gaf_image(
                             s, out_path,
                             mode=gaf_mode,

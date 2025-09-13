@@ -1,6 +1,6 @@
 # config.yaml
 data:
-  csv: Data/multi_ticker/AMAT.csv #input
+  csv: Data/market/mkt_ADBE.csv #input
   # csv: Data/apple/MBP_market.csv
   # csv: sub_data.csv
   symbol: batch # put batch when working with several symbols 
@@ -14,7 +14,7 @@ data:
 
 output:
   dir: ./dataset_out_ts
-  batch_dir: ./dataset_out_ts/all_tickerzzz #only activate when working with several ticker
+  batch_dir: ./dataset_out_ts/batch #only activate when working with several ticker
 
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
@@ -22,26 +22,35 @@ splits:
   val_end: 2025-04-09
 
 labels:
-  horizons: [2]  #Number of days
+  horizons: [1]  #Number of days
+  in_sample: false
   median_window: 100
 
 deseasonalization:
   mode: none    # none | robust_train | robust_expanding
-  bucket: hour        # minute | hour
+  bucket: minute        # minute | hour
 
-images: # Use 30min bucket / use only market data 
-  encoder: ts_vol  # heatmap | ts_vol | ts_ohlc | recurrence | gaf
-  windows: [26]
-  step: 26              # set to window size for no overlap
-  ts_ma_window: 48
-  size:
+images:  
+  encoder: ts_vol # - heatmap | ts_vol | ts_ohlc | recurrence | gaf
+  windows: [26]          # window length in bars for sampling cadence (keep 26)
+  step: 26               # stride in bars between images: 13 ≈ 1 image/day on 30-min RTH; 26 = non-overlap
+  ts_ma_window: 48       # moving average window (in bars) drawn on the top panel
+  size: 
     width: 256
     height: 256
     dpi: 100
-  alignment:
+  alignment: 
     enabled: true
-    anchor_time: "14:00"   # HH:MM interprété dans anchor_tz
-    anchor_tz: "UTC"  
+    anchor_time: "14:00"
+    anchor_tz: "UTC"
+  session:
+    enforce_end_at_close: true      # ← activer le filtre
+    tz: America/New_York            # timezone de référence (DST géré)
+    open: "09:30"                   # informatif (inutile pour le check)
+    close: "16:00"                  # l’heure de clôture
+    bar_label: end                  # "end" si timestamp = fin de bougie, "start" sinon
+  grid:
+    required_points: 26             # (optionnel) 0 ou null pour ne pas imposer la taille
 
   ts_overlays:
     top:
@@ -97,7 +106,7 @@ training:
   model: resnet18        # resnet18 | resnet50
   pretrained: true
   num_classes: 2
-  epochs: 5
+  epochs: 20
   batch_size: 64
   num_workers: 4
   lr: 1e-3

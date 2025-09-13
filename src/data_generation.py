@@ -20,7 +20,7 @@ from . import vol_smile_deseasonal as vol_smile
 from . import indicators
 from tqdm.auto import tqdm
 from .image_generations import to_heatmap_image, to_recurrence_image, to_timeseries_image, to_gaf_image, compute_global_indicators
-from .qa_data import count_missing_minutes_fixed_window
+# from .qa_data import count_missing_minutesx_fixed_window
 
 # ---------------------------
 # 1) Loading & Prep

@@ -596,8 +596,6 @@ def build_dataset(csv_path: Path,
         #lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
         lab["symbol"] = symbol
         lab["horizon"] = h
-        lab.to_csv('lab_i.csv')
-        vol_src.to_csv('vol_src_i.csv')
         
         # Temporal split
         if splits is not None:

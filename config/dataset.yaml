@@ -14,7 +14,7 @@ data:
 
 output:
   dir: ./dataset_out_ts
-  batch_dir: ./dataset_out_ts/batch #only activate when working with several ticker
+  batch_dir: ./dataset_out_ts/in_sample #only activate when working with several ticker
 
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
@@ -22,7 +22,7 @@ splits:
   val_end: 2025-04-09
 
 labels:
-  horizons: [1]  #Number of days
+  horizons: [0]  #Number of days (0.5 for in sample tests)
   in_sample: false
   median_window: 100
 
@@ -119,7 +119,7 @@ training:
   use_amp: true
   monitor: val_f1        # val_f1 | val_loss
   patience: 7
-  save_dir: runs/exp1
+  save_dir: runs/exp2
   normalize: imagenet    # imagenet | null
   augment: true
   prefer_days: true

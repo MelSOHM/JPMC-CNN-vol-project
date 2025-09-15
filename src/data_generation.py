@@ -12,6 +12,7 @@ import re
 import numpy as np
 import pandas as pd
 from pandas.tseries.offsets import BusinessDay
+from pandas.tseries.offsets import Hour
 
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -320,6 +321,20 @@ def rolling_median_ex_ante(x: pd.Series, window: int) -> pd.Series:
     """
     return x.shift(1).rolling(window=window, min_periods=window).median()
 
+def make_labels_in_sample(vol: pd.Series,
+                median_window: int = 26,   # kept for API compatibility (unused)
+                drop_na: bool = True) -> pd.DataFrame:
+    med = rolling_median_ex_ante(vol, window=median_window-1).rename("median_hist")
+    print("median window", median_window-1)
+    # future vol at first timestamp >= t + horizon_days (in hour)
+    vfut = vol.rename(f"vol_tplus_0D")
+
+    y = (vfut > med).astype("float").rename(f"y_h0")
+    out = pd.concat({"vol": vol, "median_hist": med, f"y_h0": y}, axis=1)
+    if drop_na:
+        out = out.dropna()
+    return out
+
 def lookahead_by_days(s: pd.Series, days: int) -> pd.Series:
     """
     Return a series aligned on s.index whose value at time t is s at the first
@@ -572,10 +587,18 @@ def build_dataset(csv_path: Path,
    
     meta_all = []
     for h in horizon_list:
-        lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
+        if h == 0:
+            lab = make_labels_in_sample(vol_src, median_window=image_windows[0], drop_na=True)
+            print('## [LABEL GENERATION IN SAMPLE] ##')
+        else:
+            
+            lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
+        #lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
         lab["symbol"] = symbol
         lab["horizon"] = h
-
+        lab.to_csv('lab_i.csv')
+        vol_src.to_csv('vol_src_i.csv')
+        
         # Temporal split
         if splits is not None:
             train_end = pd.to_datetime(splits[0], utc=True)
@@ -617,7 +640,7 @@ def build_dataset(csv_path: Path,
                     end_ts = idx[-1]
                     y = int(part_df.loc[end_ts, f"y_h{h}"])
                     fname = ts_to_filename(end_ts)
-                    out_path = Path(out_path_batch) / split_name / f"h{h}" / f"y{y}" / f"{fname}.png" if out_path_batch else out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
+                    out_path = Path(out_path_batch) / split_name / f"h{h}" / f"y{y}" / f"{fname}_{symbol}.png" if out_path_batch else out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
 
                     if image_encoder == "heatmap":
                         # features simples pour heatmap

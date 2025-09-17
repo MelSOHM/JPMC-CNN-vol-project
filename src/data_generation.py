@@ -726,7 +726,13 @@ def build_dataset(csv_path: Path,
     else:
         # Standard mode: use the original make_labels function
         for h in horizon_list:
-            lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
+            if h == 0:
+                lab = make_labels_in_sample(vol_src, median_window=image_windows[0], drop_na=True)
+                print('## [LABEL GENERATION IN SAMPLE] ##')
+            else:
+                
+                lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
+            #lab = make_labels(vol_src, horizon_days=h, median_window=median_window, drop_na=True)
             lab["symbol"] = symbol
             lab["horizon"] = h
 

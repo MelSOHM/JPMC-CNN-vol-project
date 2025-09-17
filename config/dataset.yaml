@@ -14,29 +14,29 @@ data:
 
 output:
   dir: ./dataset_out_ts
-  batch_dir: ./dataset_out_ts/in_sample #only activate when working with several ticker
+  batch_dir: ./dataset_out_ts/dataset_ts_ohlc #only activate when working with several ticker
 
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
   train_end: 2024-12-09
   val_end: 2025-04-09
-
+  
 labels:
   horizons: [1]  #Number of days (0.5 for in sample tests)
   in_sample: false
-  median_window: 100
+  median_window: 50
   mode: overnight_gap
 
 deseasonalization:
   mode: none    # none | robust_train | robust_expanding
   bucket: minute        # minute | hour
 
-images: # Use 30min bucket / use only market data 
-  encoder: ts_vol  # heatmap | ts_vol | ts_ohlc | recurrence | gaf
-  windows: [13]
-  step: 13              # set to window size for no overlap
-  ts_ma_window: 48
-  size:
+images:  
+  encoder: ts_ohlc # - heatmap | ts_vol | ts_ohlc | recurrence | gaf
+  windows: [26]          # window length in bars for sampling cadence (keep 26)
+  step: 26               # stride in bars between images: 13 ≈ 1 image/day on 30-min RTH; 26 = non-overlap
+  ts_ma_window: 48       # moving average window (in bars) drawn on the top panel
+  size: 
     width: 256
     height: 256
     dpi: 100

@@ -183,6 +183,17 @@ def format_confusion(cm: dict, normalize: bool = False) -> str:
 # ---------------------------
 # Train / evaluate loops
 # ---------------------------
+def _normalize_targets(y: torch.Tensor) -> torch.Tensor:
+    """
+    CrossEntropyLoss exige des labels dans [0..C-1].
+    Si on reçoit {-1,0,1}, on décale de +1 -> {0,1,2}.
+    Si déjà non-négatifs, on laisse tel quel.
+    """
+    if y.numel() == 0:
+        return y
+    if torch.min(y) < 0:
+        return y + int(-torch.min(y))
+    return y
 
 def run_epoch(model, loader, criterion, optimizer=None,
               device=torch.device("cpu"), use_amp=True):
@@ -215,6 +226,7 @@ def run_epoch(model, loader, criterion, optimizer=None,
 
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
+        yb = _normalize_targets(yb)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)

@@ -8,13 +8,13 @@ data:
   time_col: ts_event 
   resample:
     rule: "30min"     # ex: "30min", "1h", "15min" ; laisse vide/omets pour désactiver
-    label: "right"     # "left" ou "right" -> timestamp du bucket
+    label: "right"    # "left" ou "right" -> timestamp du bucket
     closed: "left"    # "left" ou "right" -> quels bords sont inclus
     drop_na: true     # drop des buckets incomplets (sans open/close)
 
 output:
   dir: ./dataset_out_ts
-  batch_dir: ./dataset_out_ts/dataset_ts_ohlc #only activate when working with several ticker
+  batch_dir: ./dataset_out_ts/overnight_gap #only activate when working with several ticker
 
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
@@ -24,7 +24,7 @@ splits:
 labels:
   horizons: [1]  #Number of days (0.5 for in sample tests)
   median_window: 50
-  mode: overnight_gap  # overnight_gap | other -> fallback to normal one
+  mode: ternary  # overnight_gap | ternary | other -> fallback to normal one
   in_sample: false # To generate in sample, the mode should not be overnight_gap
 
 deseasonalization:
@@ -32,7 +32,7 @@ deseasonalization:
   bucket: minute        # minute | hour
 
 images:  
-  encoder: ts_ohlc # - heatmap | ts_vol | ts_ohlc | recurrence | gaf
+  encoder: ts_vol        # - heatmap | ts_vol | ts_ohlc | recurrence | gaf
   windows: [26]          # window length in bars for sampling cadence (keep 26)
   step: 26               # stride in bars between images: 13 ≈ 1 image/day on 30-min RTH; 26 = non-overlap
   ts_ma_window: 48       # moving average window (in bars) drawn on the top panel
@@ -111,17 +111,17 @@ training:
   batch_size: 64
   num_workers: 4
   lr: 1e-3
-  weight_decay: 1e-3
-  dropout: 0.5           # dropout rate for final layer
+  weight_decay: 1e-2
+  dropout: 0.8           # dropout rate for final layer
   optimizer: adamw       # adamw | sgd
   scheduler: cosine      # none | cosine | step
   step_size: 10          # (if scheduler=step)
   gamma: 0.1             # (if scheduler=step)
   use_amp: true
-  monitor: val_f1        # val_f1 | val_loss
-  patience: 7
+  monitor: val_loss        # val_f1 | val_loss
+  patience: 10
   save_dir: runs/exp2
-  normalize: imagenet    # imagenet | null
+  normalize: null    # imagenet | null
   augment: true
   prefer_days: true
   return_meta: true

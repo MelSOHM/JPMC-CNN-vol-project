@@ -117,6 +117,7 @@ def main():
             image_encoder=m.image_encoder,
             ts_ma_window=m.ts_ma_window,
             img_w=m.img_w, img_h=m.img_h, img_dpi=m.img_dpi,
+            label_mode = m.label_mode,
 
             # splits & deseason
             splits=splits,

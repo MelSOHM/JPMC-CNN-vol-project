@@ -22,27 +22,28 @@ splits:
   val_end: 2025-04-09
 
 labels:
-  horizons: [0]  #Number of days (0.5 for in sample tests)
+  horizons: [1]  #Number of days (0.5 for in sample tests)
   in_sample: false
   median_window: 100
+  mode: overnight_gap
 
 deseasonalization:
   mode: none    # none | robust_train | robust_expanding
   bucket: minute        # minute | hour
 
-images:  
-  encoder: ts_vol # - heatmap | ts_vol | ts_ohlc | recurrence | gaf
-  windows: [26]          # window length in bars for sampling cadence (keep 26)
-  step: 26               # stride in bars between images: 13 ≈ 1 image/day on 30-min RTH; 26 = non-overlap
-  ts_ma_window: 48       # moving average window (in bars) drawn on the top panel
-  size: 
+images: # Use 30min bucket / use only market data 
+  encoder: ts_vol  # heatmap | ts_vol | ts_ohlc | recurrence | gaf
+  windows: [13]
+  step: 13              # set to window size for no overlap
+  ts_ma_window: 48
+  size:
     width: 256
     height: 256
     dpi: 100
   alignment: 
     enabled: true
-    anchor_time: "14:00"
-    anchor_tz: "UTC"
+    anchor_time: "09:30"   # HH:MM interprété dans anchor_tz
+    anchor_tz: "America/New_York"  
   session:
     enforce_end_at_close: true      # ← activer le filtre
     tz: America/New_York            # timezone de référence (DST géré)

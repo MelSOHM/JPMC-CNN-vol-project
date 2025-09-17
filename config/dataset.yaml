@@ -23,9 +23,9 @@ splits:
   
 labels:
   horizons: [1]  #Number of days (0.5 for in sample tests)
-  in_sample: false
   median_window: 50
   mode: overnight_gap  # overnight_gap | other -> fallback to normal one
+  in_sample: false # To generate in sample, the mode should not be overnight_gap
 
 deseasonalization:
   mode: none    # none | robust_train | robust_expanding

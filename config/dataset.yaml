@@ -14,7 +14,7 @@ data:
 
 output:
   dir: ./dataset_out_ts
-  batch_dir: ./dataset_out_ts/overnight_gap #only activate when working with several ticker
+  batch_dir: ./dataset_out_ts/small_2d_window_in_sample  #only activate when working with several ticker
 
 splits:
   # Use ISO dates; timezone optional. If omitted, we treat as UTC midnight.
@@ -23,9 +23,8 @@ splits:
   
 labels:
   horizons: [1]  #Number of days (0.5 for in sample tests)
-  median_window: 50
-  mode: ternary  # overnight_gap | ternary | other -> fallback to normal one
-  in_sample: false # To generate in sample, the mode should not be overnight_gap
+  median_window: 26
+  mode: in_sample  # overnight_gap | ternary (put num_class = 3 in trainning section) | normal | in_sample-> fallback to normal one
 
 deseasonalization:
   mode: none    # none | robust_train | robust_expanding
@@ -104,22 +103,22 @@ evaluation:
 training:
   seed: 42
   device: auto           # auto | cuda | cpu | mps
-  model: resnet18        # resnet18 | resnet50
+  model: resnet8        # resnet18 | resnet50 | resnet8 | resnet10 | resnet14 | inception_v3
   pretrained: true
   num_classes: 2
   epochs: 20
   batch_size: 64
   num_workers: 4
-  lr: 1e-3
-  weight_decay: 1e-2
-  dropout: 0.8           # dropout rate for final layer
+  lr: 1e-2
+  weight_decay: 1e-3
+  dropout: 0.5          # dropout rate for final layer
   optimizer: adamw       # adamw | sgd
   scheduler: cosine      # none | cosine | step
   step_size: 10          # (if scheduler=step)
   gamma: 0.1             # (if scheduler=step)
   use_amp: true
   monitor: val_loss        # val_f1 | val_loss
-  patience: 10
+  patience: 20
   save_dir: runs/exp2
   normalize: null    # imagenet | null
   augment: true

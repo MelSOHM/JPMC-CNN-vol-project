@@ -60,6 +60,21 @@ def _parse_ts(p: Path) -> str:
     m = TIMESTAMP_RE.search(p.stem)
     return m.group(1) if m else p.stem
 
+LABEL_DIR_RE = re.compile(r"^y(-?\d+)$")
+
+def _parse_label_dir(dirname: str) -> Optional[int]:
+    """
+    Parse 'y-1', 'y0', 'y1', 'y2', ... → int label.
+    Returns None if not a class dir.
+    """
+    m = LABEL_DIR_RE.match(dirname)
+    if not m: 
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
 def _horizon_from_dirname(name: str) -> Optional[int]:
     if len(name) >= 2 and name[0] in ("d", "h") and name[1:].isdigit():
         return int(name[1:])
@@ -97,20 +112,24 @@ def _scan_split(sym_root: Path,
         cand.append((N, child))
 
     for N, hdir in sorted(cand):
-        for y in (0, 1):
-            cls = hdir / f"y{y}"
-            if not cls.is_dir():
+        # accept any subdir 'y{label}' where label ∈ ℤ (e.g., y-1, y0, y1, y2)
+        for cls_dir in hdir.iterdir():
+            if not cls_dir.is_dir():
                 continue
-            for img_path in cls.glob("*.png"):
+            label = _parse_label_dir(cls_dir.name)
+            if label is None:
+                continue
+            for img_path in cls_dir.glob("*.png"):
                 out.append(ImgSample(
                     path=img_path,
-                    label=int(y),
+                    label=int(label),
                     split=split,
                     symbol=symbol,
                     horizon=N,
                     timestamp=_parse_ts(img_path),
                 ))
     return out
+
 
 def scan_images(root: Path,
                 symbols: Optional[Sequence[str]],
@@ -200,13 +219,26 @@ def build_transforms(img_size: Tuple[int, int],
         train_tfms = eval_tfms
     return train_tfms, eval_tfms
 
-def compute_class_weights(samples: Sequence[ImgSample]) -> torch.Tensor:
-    """Inverse frequency weights: w_c = N / (2 * N_c)."""
-    counts = {0: 0, 1: 0}
-    for s in samples: counts[s.label] += 1
-    total = counts[0] + counts[1]
-    w0 = total / (2.0 * max(1, counts[0])); w1 = total / (2.0 * max(1, counts[1]))
-    return torch.tensor([w0, w1], dtype=torch.float32)
+def compute_class_weights(samples: Sequence[ImgSample]) -> Tuple[torch.Tensor, int]:
+    """
+    Retourne (weights, offset) pour classes potentiellement négatives.
+    - offset = -min_label (ex.: labels {-1,0,1} → offset=1 et K=3)
+    - weights est un tenseur taille K, indexé par (label + offset)
+    """
+    if not samples:
+        return torch.tensor([1.0], dtype=torch.float32), 0
+    labels = sorted({s.label for s in samples})
+    min_lbl, max_lbl = min(labels), max(labels)
+    K = max_lbl - min_lbl + 1
+    offset = -min_lbl  # pour remapper dans [0..K-1]
+
+    counts = torch.zeros(K, dtype=torch.long)
+    for s in samples:
+        counts[s.label + offset] += 1
+    total = int(counts.sum().item())
+    # inverse frequency (stabilisé)
+    weights = (total / (K * torch.clamp(counts, min=1))).to(torch.float32)
+    return weights, offset
 
 
 # ---------------------------
@@ -267,17 +299,19 @@ def make_dataloaders_from_yaml(cfg_path: Union[str, Path]) -> Dict[str, DataLoad
     for s in all_samples: by_split[s.split].append(s)
 
     # quick summary
-    def _count(split): 
-        c0 = sum(1 for s in by_split[split] if s.label == 0)
-        c1 = sum(1 for s in by_split[split] if s.label == 1)
-        return c0, c1, len(by_split[split])
+    def _count_per_label(samples: List[ImgSample]) -> Dict[int, int]:
+        d: Dict[int, int] = {}
+        for s in samples:
+            d[s.label] = d.get(s.label, 0) + 1
+        return dict(sorted(d.items(), key=lambda kv: kv[0]))
 
     print(f"[DS] root={root}")
     for split in ("train","val","test"):
         if by_split[split]:
-            c0,c1,n = _count(split)
+            counts = _count_per_label(by_split[split])  # e.g., {-1: n1, 0: n0, 1: n2}
             hs = sorted({s.horizon for s in by_split[split]})
-            print(f"[DS] {split:<5} n={n} (y0={c0}, y1={c1}) horizons={hs}")
+            counts_str = ", ".join(f"y{lbl}={cnt}" for lbl, cnt in counts.items())
+            print(f"[DS] {split:<5} n={len(by_split[split])} ({counts_str}) horizons={hs}")
         else:
             print(f"[DS] {split:<5} n=0")
 
@@ -294,8 +328,8 @@ def make_dataloaders_from_yaml(cfg_path: Union[str, Path]) -> Dict[str, DataLoad
                               return_meta=return_meta, force_rgb=True)
 
         if split == "train" and balanced:
-            w = compute_class_weights(samples)
-            per_sample_w = [w[s.label].item() for s in samples]
+            w, offset = compute_class_weights(samples)
+            per_sample_w = [w[s.label + offset].item() for s in samples]
             sampler = WeightedRandomSampler(per_sample_w, num_samples=len(per_sample_w), replacement=True)
             ld = DataLoader(ds, batch_size=bs, sampler=sampler, num_workers=nw,
                             pin_memory=True, drop_last=False)

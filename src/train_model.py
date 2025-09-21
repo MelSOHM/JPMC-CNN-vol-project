@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torchvision.models as tvm
+from torchvision.models.resnet import ResNet, BasicBlock, Bottleneck
 
 try:
     import yaml
@@ -110,6 +111,27 @@ def make_amp_ctx_and_scaler(device, use_amp: bool = True, allow_cpu_amp: bool = 
 # Model builder
 # ---------------------------
 
+def _resnet_custom(blocks, num_classes=2, dropout=0.5, bottleneck=False):
+    """
+    blocks = [b1, b2, b3, b4] nombre de BasicBlocks (ou Bottleneck) par stage.
+    Ex: resnet18 = [2,2,2,2]. Ici on propose plus petit: [1,1,1,1] etc.
+    """
+    Block = Bottleneck if bottleneck else BasicBlock
+    m = ResNet(Block, blocks, num_classes=num_classes)  # pas de prétrain pour ces profondeurs
+    in_feats = m.fc.in_features
+    m.fc = nn.Sequential(nn.Dropout(dropout), nn.Linear(in_feats, num_classes))
+    return m
+
+def resnet8(num_classes=2, dropout=0.5):   # 2*sum(blocks)=8 couches (BasicBlock)
+    return _resnet_custom([1,1,1,1], num_classes=num_classes, dropout=dropout, bottleneck=False)
+
+def resnet10(num_classes=2, dropout=0.5):
+    # 10 ~ [1,1,1,2] (approximation simple)
+    return _resnet_custom([1,1,1,2], num_classes=num_classes, dropout=dropout, bottleneck=False)
+
+def resnet14(num_classes=2, dropout=0.5):
+    return _resnet_custom([1,1,2,3], num_classes=num_classes, dropout=dropout, bottleneck=False)
+
 def build_model(name: str, num_classes: int = 2, pretrained: bool = True, dropout: float = 0.5) -> nn.Module:
     name = (name or "resnet18").lower()
     if name == "resnet18":
@@ -136,49 +158,90 @@ def build_model(name: str, num_classes: int = 2, pretrained: bool = True, dropou
             nn.Linear(in_feats, num_classes)
         )
         return m
+    
+    # --- ResNet courts (no pre-train)
+    if name == "resnet8":
+        return resnet8(num_classes=num_classes, dropout=dropout)
+    if name == "resnet10":
+        return resnet10(num_classes=num_classes, dropout=dropout)
+    if name == "resnet14":
+        return resnet14(num_classes=num_classes, dropout=dropout)
     raise ValueError(f"Unknown model '{name}'. Supported: resnet18, resnet50")
 
 # ---------------------------
-# Metrics (binary)
+# Metrics (multi-class)
 # ---------------------------
 
 @torch.no_grad()
-def compute_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
-    # logits: [B,2], targets: [B] in {0,1}
-    preds = logits.argmax(dim=1)
-    tp = ((preds == 1) & (targets == 1)).sum().item()
-    tn = ((preds == 0) & (targets == 0)).sum().item()
-    fp = ((preds == 1) & (targets == 0)).sum().item()
-    fn = ((preds == 0) & (targets == 1)).sum().item()
-    acc = (tp + tn) / max(1, tp + tn + fp + fn)
-    prec = tp / max(1, tp + fp)
-    rec = tp / max(1, tp + fn)
-    f1 = 2 * prec * rec / max(1e-8, (prec + rec))
-    return {"acc": acc, "precision": prec, "recall": rec, "f1": f1}
-
-def update_confusion_counts(logits: torch.Tensor, targets: torch.Tensor, acc):
-    """Accumulate confusion counts in-place in dict acc={'tp':..,'tn':..,'fp':..,'fn':..}."""
-    preds = logits.argmax(dim=1)
-    acc["tp"] += int(((preds == 1) & (targets == 1)).sum().item())
-    acc["tn"] += int(((preds == 0) & (targets == 0)).sum().item())
-    acc["fp"] += int(((preds == 1) & (targets == 0)).sum().item())
-    acc["fn"] += int(((preds == 0) & (targets == 1)).sum().item())
-
-def format_confusion(cm: dict, normalize: bool = False) -> str:
+def confusion_matrix_from_logits(logits: torch.Tensor, targets: torch.Tensor, num_classes: int) -> torch.Tensor:
     """
-    Return a pretty 2x2 matrix as string:
-      [[TN, FP],
-       [FN, TP]]
-    If normalize=True, each cell is divided by total.
+    Retourne une matrice de confusion [K,K] avec K=num_classes.
+    L'axe 0 = vrai (rows), axe 1 = préd (cols).
     """
-    tn, fp, fn, tp = cm["tn"], cm["fp"], cm["fn"], cm["tp"]
+    preds = logits.argmax(dim=1)
+    t = targets.view(-1).to(torch.int64)
+    p = preds.view(-1).to(torch.int64)
+
+    # filtrer les labels hors [0..K-1] par sécurité
+    mask = (t >= 0) & (t < num_classes)
+    t = t[mask]; p = p[mask]
+
+    cm = torch.bincount(t * num_classes + p, minlength=num_classes * num_classes)
+    cm = cm.view(num_classes, num_classes)
+    return cm
+
+@torch.no_grad()
+def compute_multiclass_metrics(cm: torch.Tensor) -> Dict[str, float]:
+    """
+    À partir d'une matrice de confusion KxK, calcule:
+    - accuracy
+    - macro_precision, macro_recall, macro_f1
+    - micro_precision (=acc), micro_recall, micro_f1 (=acc)
+    """
+    K = cm.shape[0]
+    tp = cm.diag()
+    support = cm.sum(dim=1)           # vrais par classe
+    pred_pos = cm.sum(dim=0)          # prédits par classe
+    total = cm.sum()
+
+    acc = (tp.sum() / total).item() if total > 0 else 0.0
+
+    prec_k = tp / torch.clamp(pred_pos, min=1)
+    rec_k  = tp / torch.clamp(support,  min=1)
+    f1_k   = 2 * prec_k * rec_k / torch.clamp(prec_k + rec_k, min=1e-8)
+
+    macro_precision = prec_k.mean().item()
+    macro_recall    = rec_k.mean().item()
+    macro_f1        = f1_k.mean().item()
+
+    # micro = global
+    micro_precision = acc
+    micro_recall    = acc
+    micro_f1        = acc
+
+    return {
+        "acc": acc,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
+        "micro_precision": micro_precision,
+        "micro_recall": micro_recall,
+        "micro_f1": micro_f1,
+    }
+
+def format_confusion(cm: torch.Tensor, normalize: bool = False) -> str:
+    """
+    Affiche joliment une matrice KxK.
+    Rows = vrais, Cols = prédits.
+    """
     if normalize:
-        tot = max(1, tn + fp + fn + tp)
-        tn, fp, fn, tp = (x / tot for x in (tn, fp, fn, tp))
-        return (f"[[{tn:.3f}, {fp:.3f}],\n"
-                f" [{fn:.3f}, {tp:.3f}]]")
-    return (f"[[{tn}, {fp}],\n [{fn}, {tp}]]")
-
+        tot = cm.sum().item()
+        M = (cm.float() / max(1.0, tot)).cpu().numpy()
+        rows = ["[" + ", ".join(f"{x:.3f}" for x in r) + "]" for r in M]
+    else:
+        M = cm.cpu().numpy().astype(int)
+        rows = ["[" + ", ".join(str(int(x)) for x in r) + "]" for r in M]
+    return "[\n " + ",\n ".join(rows) + "\n]"
 
 # ---------------------------
 # Train / evaluate loops
@@ -197,28 +260,23 @@ def _normalize_targets(y: torch.Tensor) -> torch.Tensor:
 
 def run_epoch(model, loader, criterion, optimizer=None,
               device=torch.device("cpu"), use_amp=True):
-    """
-    One epoch over `loader`.
-    - Train if `optimizer` is not None, else eval.
-    - Uses `make_amp_ctx_and_scaler(device, use_amp)` for AMP compat
-      across CUDA / MPS / CPU and PyTorch versions.
-    - Returns: (avg_loss, metrics_dict, confusion_dict)
-    """
     is_train = optimizer is not None
     model.train(is_train)
 
-    # metrics accumulators
     total_loss = 0.0
-    m_sum = {"acc": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
     n_batches = 0
-    cm = {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
 
-    # Create a single scaler for the whole epoch (if CUDA+AMP).
-    # We'll create a fresh autocast context *per batch*.
+    # on accumule la CM sur tout l'epoch
+    num_classes = getattr(model.fc[-1], "out_features", None) if hasattr(model, "fc") else None
+    if num_classes is None:
+        # fallback robuste
+        # on fera un premier batch pour inférer K
+        num_classes = -1
+    cm_accum = None
+
     _, scaler = make_amp_ctx_and_scaler(device, use_amp)
 
     for batch in loader:
-        # support (x, y) or (x, y, meta)
         if isinstance(batch, (list, tuple)) and len(batch) >= 2:
             xb, yb = batch[0], batch[1]
         else:
@@ -231,10 +289,11 @@ def run_epoch(model, loader, criterion, optimizer=None,
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
-        # fresh autocast context each iteration (compat new/old PyTorch)
         ctx, _ = make_amp_ctx_and_scaler(device, use_amp)
         with ctx:
             logits = model(xb)
+            if num_classes == -1:
+                num_classes = logits.shape[1]
             loss = criterion(logits, yb)
 
         if is_train:
@@ -247,15 +306,14 @@ def run_epoch(model, loader, criterion, optimizer=None,
                 optimizer.step()
 
         total_loss += float(loss.item())
-        update_confusion_counts(logits.detach(), yb, cm)
-        m = compute_metrics(logits.detach(), yb)
-        for k in m_sum:
-            m_sum[k] += m[k]
+        cm_batch = confusion_matrix_from_logits(logits.detach(), yb, num_classes)
+        cm_accum = cm_batch if cm_accum is None else (cm_accum + cm_batch)
         n_batches += 1
 
     avg_loss = total_loss / max(1, n_batches)
-    metrics = {k: (m_sum[k] / max(1, n_batches)) for k in m_sum}
-    return avg_loss, metrics, cm
+    metrics = compute_multiclass_metrics(cm_accum if cm_accum is not None else torch.zeros((num_classes, num_classes)))
+    return avg_loss, metrics, cm_accum
+
 
 # ---------------------------
 # Checkpointing / early stopping
@@ -306,14 +364,18 @@ def main():
     use_class_weights = bool(_get(cfg, "training.class_weights", False))
     ce_weight = None
     if use_class_weights and train_loader is not None:
-        # compute inverse-freq weights from the dataset already loaded
-        # the dataset stores labels in dataset.samples (ImageOnlyDataset)
-        counts = {0: 0, 1: 0}
+        # Essaye d'inférer K depuis le modèle ou dataset
+        num_classes = int(_get(cfg, "training.num_classes", 3))
+        counts = torch.zeros(num_classes, dtype=torch.long)
         for s in getattr(train_loader.dataset, "samples", []):
-            counts[int(s.label)] += 1
-        total = counts[0] + counts[1]
-        w0 = total / (2.0 * max(1, counts[0])); w1 = total / (2.0 * max(1, counts[1]))
-        ce_weight = torch.tensor([w0, w1], dtype=torch.float32, device=device)
+            y = int(s.label)
+            if y < 0:
+                y += 1  # map {-1,0,1} -> {0,1,2}
+            if 0 <= y < num_classes:
+                counts[y] += 1
+        total = int(counts.sum().item())
+        # inverse-frequency (stabilisé)
+        ce_weight = (total / (num_classes * torch.clamp(counts, min=1))).to(torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=ce_weight)
 
     # Optimizer
@@ -355,7 +417,6 @@ def main():
     print(f"[CFG] model={model_name} pretrained={pretrained} device={device} "
           f"epochs={max_epochs} lr={lr} opt={opt_name} sch={sch_name} use_amp={use_amp}")
     print(f"[CFG] monitor={monitor} patience={patience} class_weights={use_class_weights} save_dir={save_dir}")
-
     # ---------------- Train loop ----------------
     best_monitor = float("inf") if monitor == "val_loss" else -float("inf")
     bad_epochs = 0
@@ -377,9 +438,9 @@ def main():
         dt = time.time() - t0
 
         print(f"[E{epoch:03d}] "
-            f"train: loss={tr_loss:.4f} acc={tr_metrics['acc']:.3f} f1={tr_metrics['f1']:.3f} | "
-            f"val: loss={va_loss:.4f} acc={va_metrics['acc']:.3f} f1={va_metrics['f1']:.3f} "
-            f"({dt:.1f}s)")
+        f"train: loss={tr_loss:.4f} acc={tr_metrics['acc']:.3f} macroF1={tr_metrics['macro_f1']:.3f} | "
+        f"val: loss={va_loss:.4f} acc={va_metrics['acc']:.3f} macroF1={va_metrics['macro_f1']:.3f} "
+        f"({dt:.1f}s)")
         
         if show_cm:
             print("[CM][train]\n" + format_confusion(tr_cm, normalize=norm_cm))
@@ -389,7 +450,7 @@ def main():
         save_checkpoint(save_last, model, optimizer, scheduler, epoch, best_monitor, cfg)
 
         # early stopping on monitor
-        cur = (-va_loss) if monitor == "val_loss" else va_metrics["f1"]
+        cur = (-va_loss) if monitor == "val_loss" else va_metrics.get("macro_f1", va_metrics.get("f1", float("nan")))
         improved = (cur > best_monitor)
         if improved:
             best_monitor = cur
@@ -409,8 +470,8 @@ def main():
         te_loss, te_metrics, te_cm = run_epoch(model, test_loader, criterion, optimizer=None,
                                             device=device, use_amp=use_amp)
         print(f"[TEST] loss={te_loss:.4f} acc={te_metrics['acc']:.3f} "
-            f"prec={te_metrics['precision']:.3f} rec={te_metrics['recall']:.3f} "
-            f"f1={te_metrics['f1']:.3f}")
+            f"macroP={te_metrics['macro_precision']:.3f} macroR={te_metrics['macro_recall']:.3f} "
+            f"macroF1={te_metrics['macro_f1']:.3f}")
         if show_cm:
             print("[CM][test]\n" + format_confusion(te_cm, normalize=norm_cm))
 

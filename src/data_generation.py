@@ -470,7 +470,7 @@ def make_labels_ternary(
     horizon_days: int = 1,
     median_window: int = 100,
     *,
-    band_value: float = 0.1,          # intensité de la bande
+    band_value: float = 0.3,          # intensité de la bande
     band_mode: str = "pct",           # "abs" | "pct" | "mad"
     drop_na: bool = True,
 ) -> pd.DataFrame:

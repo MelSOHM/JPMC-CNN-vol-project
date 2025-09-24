@@ -122,6 +122,119 @@ def _resnet_custom(blocks, num_classes=2, dropout=0.5, bottleneck=False):
     m.fc = nn.Sequential(nn.Dropout(dropout), nn.Linear(in_feats, num_classes))
     return m
 
+class SmallCNN(nn.Module):
+    """
+    Tiny CNN pour petits datasets (quelques dizaines/centaines d'images/classe).
+    Entrée: images 3xHxW (si 1 canal, adapte dans ton loader ou mets conv1=1).
+    """
+    def __init__(self, num_classes=2, in_ch=1, width=32, dropout=0.3):
+        super().__init__()
+        w = width
+        self.features = nn.Sequential(
+            nn.Conv2d(in_ch, w, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(w), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # H/2
+
+            nn.Conv2d(w, 2*w, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(2*w), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # H/4
+
+            nn.Conv2d(2*w, 4*w, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(4*w), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),  # -> (N, 4w, 1, 1)
+        )
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(4*w, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        return self.head(x)
+    
+
+# --- TinyResNet: plus petit que ResNet8 (64/128/256/512), plus grand que SmallCNN ---
+class TinyBasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, in_ch, out_ch, stride=1, norm_layer=nn.BatchNorm2d):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1   = norm_layer(out_ch)
+        self.relu  = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2   = norm_layer(out_ch)
+
+        self.downsample = None
+        if stride != 1 or in_ch != out_ch:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                norm_layer(out_ch)
+            )
+
+    def forward(self, x):
+        idt = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.downsample is not None:
+            idt = self.downsample(x)
+        out += idt
+        return self.relu(out)
+
+class TinyResNet(nn.Module):
+    """
+    TinyResNet '12 couches' ~ (1,1,1,1) BasicBlocks avec canaux réduits.
+    - stem 3x3 stride 1, puis 4 stages avec strides [1,2,2,2]
+    - base_channels=32 par défaut -> [32,64,128,256]
+    """
+    def __init__(self, num_classes=2, in_ch=3, base_channels=32, layers=(1,1,1,1),
+                 dropout=0.5, norm_layer=nn.BatchNorm2d):
+        super().__init__()
+        C1, C2, C3, C4 = [base_channels*(2**i) for i in range(4)]
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, C1, kernel_size=3, stride=1, padding=1, bias=False),
+            norm_layer(C1),
+            nn.ReLU(inplace=True)
+        )
+        self.layer1 = self._make_layer(C1, C1, layers[0], stride=1, norm_layer=norm_layer)
+        self.layer2 = self._make_layer(C1, C2, layers[1], stride=2, norm_layer=norm_layer)
+        self.layer3 = self._make_layer(C2, C3, layers[2], stride=2, norm_layer=norm_layer)
+        self.layer4 = self._make_layer(C3, C4, layers[3], stride=2, norm_layer=norm_layer)
+        self.pool   = nn.AdaptiveAvgPool2d(1)
+        self.head   = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(C4, num_classes)
+        )
+
+        # init simple
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
+
+    def _make_layer(self, in_ch, out_ch, blocks, stride, norm_layer):
+        layers = [TinyBasicBlock(in_ch, out_ch, stride=stride, norm_layer=norm_layer)]
+        for _ in range(1, blocks):
+            layers.append(TinyBasicBlock(out_ch, out_ch, stride=1, norm_layer=norm_layer))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x); x = self.layer2(x); x = self.layer3(x); x = self.layer4(x)
+        x = self.pool(x).flatten(1)
+        return self.head(x)
+
+def tinyresnet(num_classes=2, dropout=0.5, base_channels=32, layers=(1,1,1,1), in_ch=1):
+    """
+    Modèle 'entre deux':
+    - base_channels=32 -> plus petit que ResNet8 (64) mais plus gros que SmallCNN
+    - layers (1,1,1,1) ≈ 12 conv 'profondes' (2 conv / bloc)
+    """
+    return TinyResNet(num_classes=num_classes, in_ch=in_ch,
+                      base_channels=base_channels, layers=layers, dropout=dropout)
+
+
 def resnet8(num_classes=2, dropout=0.5):   # 2*sum(blocks)=8 couches (BasicBlock)
     return _resnet_custom([1,1,1,1], num_classes=num_classes, dropout=dropout, bottleneck=False)
 
@@ -161,11 +274,18 @@ def build_model(name: str, num_classes: int = 2, pretrained: bool = True, dropou
     
     # --- ResNet courts (no pre-train)
     if name == "resnet8":
-        return resnet8(num_classes=num_classes, dropout=dropout)
+        return resnet8(num_classes=num_classes, dropout=dropout) # 5M param 
     if name == "resnet10":
         return resnet10(num_classes=num_classes, dropout=dropout)
     if name == "resnet14":
         return resnet14(num_classes=num_classes, dropout=dropout)
+    
+    if name in {"smallcnn", "cnn_small", "tinycnn"}:
+        return SmallCNN(num_classes=num_classes, in_ch=1, width=32, dropout=dropout) # 100K param
+
+    if name == 'tinyresnet':
+        return tinyresnet(num_classes=2, dropout=0.5, base_channels=32, layers=(1,1,1,1), in_ch=1)
+    
     raise ValueError(f"Unknown model '{name}'. Supported: resnet18, resnet50")
 
 # ---------------------------
@@ -331,6 +451,34 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_monitor, cfg)
         "config": cfg_json,  
     }, path)
 
+def safe_load_backbone(model: torch.nn.Module, ckpt_path: Path, device) -> bool:
+    """
+    Charge uniquement l'intersection des clés avec formes identiques.
+    Ignore le head (fc.*) et toute couche absente/mismatch.
+    Retourne True si au moins un tenseur a été chargé.
+    """
+    if not ckpt_path.exists():
+        return False
+    ckpt = torch.load(ckpt_path, map_location=device)
+    sd_pre = ckpt.get("model_state", ckpt)  # compat: parfois on a un state_dict brut
+    sd_now = model.state_dict()
+
+    ok = {}
+    for k, v in sd_pre.items():
+        if k.startswith("fc."):               # <-- adapte ce préfixe si ton head a un autre nom
+            continue
+        if k in sd_now and sd_now[k].shape == v.shape:
+            ok[k] = v
+
+    if not ok:
+        print(f"[WARN] No matching tensors in {ckpt_path} (arch mismatch).")
+        return False
+
+    missing, unexpected = model.load_state_dict({**sd_now, **ok}, strict=False)
+    print(f"[INIT] Loaded {len(ok)} tensors from {ckpt_path.name} "
+          f"(missing={len(missing)}, unexpected={len(unexpected)}).")
+    return True
+
 # ---------------------------
 # Main training entry
 # ---------------------------
@@ -338,10 +486,14 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_monitor, cfg)
 def main():
     ap = argparse.ArgumentParser(description="Train a CNN from YAML config.")
     ap.add_argument("--config", type=str, default="config/dataset.yaml", help="Path to YAML config.")
+    ap.add_argument("--resume", type=str, default="", help="Path checkpoint to resume from (e.g., runs/exp/last.pt)")
     args = ap.parse_args()
 
     cfg_path = Path(args.config)
     cfg = yaml.safe_load(cfg_path.read_text()) or {}
+    resume_path_cfg = _get(cfg, "training.resume", "") or ""
+    resume_path = Path(args.resume or resume_path_cfg) if (args.resume or resume_path_cfg) else None
+    args = ap.parse_args()
 
     # Repro & device
     seed = int(_get(cfg, "training.seed", 42)); set_seed(seed)
@@ -408,11 +560,49 @@ def main():
     use_amp = bool(_get(cfg, "training.use_amp", True))
     monitor = (_get(cfg, "training.monitor", "val_f1") or "val_f1").lower()  # 'val_loss' or 'val_f1'
     patience = int(_get(cfg, "training.patience", 7))
-    save_dir = Path(_get(cfg, "training.save_dir", "runs/exp"))
     show_cm = bool(_get(cfg, "training.show_confusion", True))
     norm_cm = bool(_get(cfg, "training.normalize_confusion", False))
+    
+    base_dir   = Path(_get(cfg, "training.save_dir", "runs/exp"))
+    model_name = (_get(cfg, "training.model", "resnet18") or "resnet18").lower()
+    num_classes = int(_get(cfg, "training.num_classes", 2))
+    tag = f"{model_name}-k{num_classes}"
+    save_dir = base_dir / tag
+    save_dir.mkdir(parents=True, exist_ok=True)
     save_best = save_dir / "best.pt"
     save_last = save_dir / "last.pt"
+    
+    start_epoch = 1  # par défaut
+    if resume_path is not None and resume_path.exists():
+        print(f"[RESUME] Loading checkpoint from {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+
+        # IMPORTANT: le modèle doit avoir la même archi / num_classes
+        missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+        if missing or unexpected:
+            print(f"[WARN] State dict: missing={missing}, unexpected={unexpected}")
+
+        if ckpt.get("optimizer_state") is not None and optimizer is not None:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            except Exception as e:
+                print(f"[WARN] Couldn't load optimizer state: {e}")
+
+        if ckpt.get("scheduler_state") is not None and scheduler is not None:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
+            except Exception as e:
+                print(f"[WARN] Couldn't load scheduler state: {e}")
+
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_monitor = float(ckpt.get("best_monitor", -float("inf") if _get(cfg,"training.monitor","val_f1")!="val_loss" else float("inf")))
+        bad_epochs = int(ckpt.get("bad_epochs", 0))
+
+        print(f"[RESUME] start_epoch={start_epoch} best_monitor={best_monitor:.6f} bad_epochs={bad_epochs}")
+    else:
+        start_epoch = 1
+        bad_epochs = 0
+        best_monitor = float("inf") if monitor == "val_loss" else -float("inf")
 
     print(f"[CFG] model={model_name} pretrained={pretrained} device={device} "
           f"epochs={max_epochs} lr={lr} opt={opt_name} sch={sch_name} use_amp={use_amp}")
@@ -463,10 +653,39 @@ def main():
                 print(f"[EARLY] No improvement for {patience} epochs — stopping.")
                 break
 
+    # # ---------------- Test (optional) ----------------
+    # if test_loader is not None and save_best.exists():
+    #     ckpt = torch.load(save_best, map_location=device)
+    #     model.load_state_dict(ckpt["model_state"])
+    #     te_loss, te_metrics, te_cm = run_epoch(model, test_loader, criterion, optimizer=None,
+    #                                         device=device, use_amp=use_amp)
+    #     print(f"[TEST] loss={te_loss:.4f} acc={te_metrics['acc']:.3f} "
+    #         f"macroP={te_metrics['macro_precision']:.3f} macroR={te_metrics['macro_recall']:.3f} "
+    #         f"macroF1={te_metrics['macro_f1']:.3f}")
+    #     if show_cm:
+    #         print("[CM][test]\n" + format_confusion(te_cm, normalize=norm_cm))
+    
     # ---------------- Test (optional) ----------------
-    if test_loader is not None and save_best.exists():
-        ckpt = torch.load(save_best, map_location=device)
-        model.load_state_dict(ckpt["model_state"])
+    if test_loader is not None:
+        # Essaye d'abord best.pt ; si incompatible, tente last.pt ; sinon teste en mémoire
+        loaded = False
+        if save_best.exists():
+            try:
+                loaded = safe_load_backbone(model, save_best, device=device)
+                if not loaded:
+                    print("[WARN] best.pt incompatible; trying last.pt")
+            except Exception as e:
+                print(f"[WARN] Failed to load best.pt: {e}")
+
+        if not loaded and save_last.exists():
+            try:
+                loaded = safe_load_backbone(model, save_last, device=device)
+            except Exception as e:
+                print(f"[WARN] Failed to load last.pt: {e}")
+
+        if not loaded:
+            print("[WARN] No compatible checkpoint; testing current in-memory weights.")
+
         te_loss, te_metrics, te_cm = run_epoch(model, test_loader, criterion, optimizer=None,
                                             device=device, use_amp=use_amp)
         print(f"[TEST] loss={te_loss:.4f} acc={te_metrics['acc']:.3f} "

@@ -11,7 +11,8 @@ import re
 
 import numpy as np
 import pandas as pd
-from .make_labels import *
+from pandas.tseries.offsets import BusinessDay
+from pandas.tseries.offsets import Hour
 
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -19,8 +20,7 @@ import matplotlib.pyplot as plt
 from . import vol_smile_deseasonal as vol_smile
 from . import indicators
 from tqdm.auto import tqdm
-from .image_generations import to_heatmap_image, to_recurrence_image, to_timeseries_image, to_gaf_image, compute_global_indicators
-# from .qa_data import count_missing_minutesx_fixed_window
+from .image_generations import compute_global_indicators
 
 # ---------------------------
 # 1) Loading & Prep
@@ -33,13 +33,6 @@ try:
     import yaml
 except ImportError as e:
     yaml = None 
-
-def _resolve_config_path(p: str | Path) -> Path:
-    p = Path(p)
-    if p.is_absolute():
-        return p
-    here = Path(__file__).parent
-    return (here / p).resolve()
 
 from pathlib import Path
 
@@ -315,7 +308,194 @@ def garman_klass_sigma(df: pd.DataFrame,
 # 3) Rolling Median and ex-ante t+h labels
 # -----------------------------------------------
 
-#Moved to a different file 
+def rolling_median_ex_ante(x: pd.Series, window: int) -> pd.Series:
+    """
+    Rolling median only based on historical data (excluding today).
+    """
+    return x.shift(1).rolling(window=window, min_periods=window).median()
+
+def make_labels_in_sample(vol: pd.Series,
+                median_window: int = 26,   # kept for API compatibility (unused)
+                drop_na: bool = True) -> pd.DataFrame:
+    med = rolling_median_ex_ante(vol, window=median_window-1).rename("median_hist")
+    print("median window", median_window-1)
+    # future vol at first timestamp >= t + horizon_days (in hour)
+    vfut = vol.rename(f"vol_tplus_0D")
+
+    y = (vfut > med).astype("float").rename(f"y_h0")
+    out = pd.concat({"vol": vol, "median_hist": med, f"y_h0": y}, axis=1)
+    if drop_na:
+        out = out.dropna()
+    return out
+
+def lookahead_by_days(s: pd.Series, days: int) -> pd.Series:
+    """
+    Return a series aligned on s.index whose value at time t is s at the first
+    timestamp >= (t + days). Works with tz-aware DatetimeIndex and irregular grids.
+    """
+    if not isinstance(s.index, pd.DatetimeIndex):
+        raise TypeError("lookahead_by_bdays expects a DatetimeIndex")
+    idx = s.index
+    target = idx + BusinessDay(days)
+    pos = idx.get_indexer(target, method="bfill")
+    out = pd.Series(np.nan, index=idx, name=f"{s.name}_tplus_{days}B")
+    ok = pos != -1
+    if ok.any():
+        vals = s.to_numpy()
+        out.iloc[ok] = vals[pos[ok]]
+    return out
+
+def make_labels(vol: pd.Series,
+                horizon_days: int = 1,
+                median_window: int = 100,
+                drop_na: bool = True) -> pd.DataFrame:
+    """
+    Build ex-ante binary labels using a *calendar-day* horizon:
+    y_t = 1{ vol_{first ts >= t + horizon_days} > median_hist_t },
+    where median_hist_t is the rolling historical median up to t-1.
+    Notes:
+    - horizon measured in days (calendar).
+    - if no future timestamp exists, label is NaN and will be dropped.
+    """
+    # historical median (no look-ahead at t)
+    med = rolling_median_ex_ante(vol, window=median_window).rename("median_hist")
+    
+    # future vol at first timestamp >= t + horizon_days
+    vfut = lookahead_by_days(vol, horizon_days).rename(f"vol_tplus_{horizon_days}D")
+
+    y = (vfut > med).astype("float").rename(f"y_h{horizon_days}")
+    out = pd.concat({"vol": vol, "median_hist": med, f"y_h{horizon_days}": y}, axis=1)
+    if drop_na:
+        out = out.dropna()
+    return out
+
+def _infer_step_timedelta(idx: pd.DatetimeIndex) -> pd.Timedelta:
+    try:
+        f = pd.infer_freq(idx)
+        if f:
+            return pd.tseries.frequencies.to_offset(f).delta
+    except Exception:
+        pass
+    if len(idx) < 2:
+        return pd.Timedelta(0)
+    diffs_ns = np.diff(idx.view("i8"))
+    return pd.Timedelta(int(np.median(diffs_ns)), unit="ns")
+
+def make_labels_overnight(
+    ohlcv: pd.DataFrame,
+    horizon_days: int = 1,
+    median_window: int = 100,
+    drop_na: bool = True,
+    *,
+    tz_local: str = "America/New_York",
+    open_time: str = "09:30",
+    close_time: str = "16:00",
+    bar_label: str = "end",         # "end" si timestamp = fin de bougie, "start" sinon
+    use_business_days: bool = True,  # True => BDay (week-ends exclus), False => jours calendaires
+) -> pd.DataFrame:
+    """Return format identical to base make_labels(): ['vol','median_hist',f'y_h{horizon_days}'] on the same intraday index."""
+    req = {"open", "close"}
+    if not req.issubset(ohlcv.columns):
+        raise ValueError(f"Missing columns: {req - set(ohlcv.columns)}")
+    if not isinstance(ohlcv.index, pd.DatetimeIndex) or ohlcv.index.tz is None:
+        raise TypeError("ohlcv index must be a tz-aware UTC DatetimeIndex.")
+
+    step = _infer_step_timedelta(ohlcv.index)
+
+    # Local timestamps to detect per-day open/close bars
+    idx_loc   = ohlcv.index.tz_convert(tz_local)
+    days_loc  = idx_loc.normalize()
+    open_loc  = pd.to_datetime(days_loc.strftime("%Y-%m-%d") + " " + open_time).tz_localize(tz_local)
+    close_loc = pd.to_datetime(days_loc.strftime("%Y-%m-%d") + " " + close_time).tz_localize(tz_local)
+    ts_open_expect  = open_loc + step if bar_label == "end" else open_loc
+    ts_close_expect = close_loc       if bar_label == "end" else close_loc - step
+
+    mask_open  = (idx_loc == ts_open_expect)
+    mask_close = (idx_loc == ts_close_expect)
+
+    open_series  = ohlcv.loc[mask_open,  "open"].copy()
+    close_series = ohlcv.loc[mask_close, "close"].copy()
+
+    # If missing sessions, return empty frame with correct columns
+    colnames = ["vol", "median_hist", f"y_h{horizon_days}"]
+    if close_series.empty or open_series.empty:
+        return pd.DataFrame(index=ohlcv.index, columns=colnames).dropna()
+
+    # For each local EOD day t, pick next day's open at +h days
+    eod_days_loc = close_series.index.tz_convert(tz_local).normalize()
+    if use_business_days:
+        tgt_days_loc = eod_days_loc + BusinessDay(horizon_days)
+    else:
+        tgt_days_loc = eod_days_loc + pd.Timedelta(days=horizon_days)
+
+    tgt_open_loc = pd.to_datetime(tgt_days_loc.strftime("%Y-%m-%d") + " " + open_time).tz_localize(tz_local)
+    tgt_open_ts  = tgt_open_loc + step if bar_label == "end" else tgt_open_loc
+    tgt_open_utc = tgt_open_ts.tz_convert("UTC")
+
+    # Map EOD -> next open price
+    open_fwd = open_series.reindex(tgt_open_utc)
+    open_fwd.index = close_series.index  # align on EOD index
+
+    # Overnight per day (EOD index)
+    ov_day = (np.log(open_fwd) - np.log(close_series)).abs()
+    ov_day.name = "vol"
+    med_day = ov_day.shift(1).rolling(median_window, min_periods=median_window).median()
+    med_day.name = "median_hist"
+
+    # Broadcast to *all intraday bars* of day t (keep same number of windows)
+    day2ov  = pd.Series(ov_day.values, index=eod_days_loc)   # key: local day -> ov value
+    day2med = pd.Series(med_day.values, index=eod_days_loc)
+
+    base_days_loc = ohlcv.index.tz_convert(tz_local).normalize()
+    # map() on an Index returns ndarray → wrap back into Series with the original intraday index
+    vol_full = pd.Series(base_days_loc.map(day2ov.to_dict()), index=ohlcv.index, name="vol")
+    med_full = pd.Series(base_days_loc.map(day2med.to_dict()), index=ohlcv.index, name="median_hist")
+
+    yname  = f"y_h{horizon_days}"
+    y_full = pd.Series((vol_full.values > med_full.values).astype(float), index=ohlcv.index, name=yname)
+
+    out = pd.concat([vol_full, med_full, y_full], axis=1)
+    return out.dropna() if drop_na else out
+
+def make_labels_ternary(
+    vol: pd.Series,
+    horizon_days: int = 1,
+    median_window: int = 100,
+    *,
+    band_value: float = 0.3,          # intensité de la bande
+    band_mode: str = "pct",           # "abs" | "pct" | "mad"
+    drop_na: bool = True,
+) -> pd.DataFrame:
+    """
+    Ternary labels with a dead-band around the rolling ex-ante median.
+    Output columns: ["vol", "median_hist", f"y_h{horizon_days}"], where y ∈ {-1,0,1}.
+    Thresholds:
+        abs : [m - band, m + band]
+        pct : [m*(1-band), m*(1+band)]
+        mad : [m - band*MAD, m + band*MAD] with ex-ante rolling MAD
+    """
+    med = rolling_median_ex_ante(vol, window=median_window).rename("median_hist")
+
+    if band_mode == "abs":
+        lo, hi = med - band_value, med + band_value
+    elif band_mode == "pct":
+        lo, hi = med * (1 - band_value), med * (1 + band_value)
+    elif band_mode == "mad":
+        r = vol.shift(1).rolling(median_window, min_periods=median_window)
+        mad = r.apply(lambda x: np.median(np.abs(x - np.median(x))), raw=True)
+        lo, hi = med - band_value * mad, med + band_value * mad
+    else:
+        raise ValueError("band_mode must be one of {'abs','pct','mad'}")
+
+    vfut = lookahead_by_days(vol, horizon_days).rename(f"vol_tplus_{horizon_days}D")
+    up = (vfut > hi).astype(int)
+    dn = -(vfut < lo).astype(int)
+    y = (up + dn).rename(f"y_h{horizon_days}")  # in {-1,0,1}
+
+    out = pd.concat({"vol": vol, "median_hist": med, y.name: y}, axis=1)
+    return out.dropna() if drop_na else out
+
+def cls_name(y): return { -1:"yneg1", 0:"y0", 1:"ypos1" }[int(y)]
 
 # -------------------------------------------------
 # 4) (train/val/test) temporal split 
@@ -426,7 +606,7 @@ def _freq_info(idx):
 # 5) Image generation
 # ------------------------------------------------------
 
-# Moved to a different file
+# Moved to another file
 
 # -----------------------------------------------------
 # 6) Assembly: labels generation + images & CSV
@@ -496,7 +676,6 @@ def build_dataset(csv_path: Path,
         rs_closed=rs_closed,
         rs_dropna=rs_dropna,
     )
-    df.to_csv('check.csv')
     _freq_info(df.index)
     ohlcv = df[["open","high","low","close"] + ([ "volume"] if "volume" in df.columns else [])].copy()
     vol_raw = garman_klass_sigma(df).sort_index()
@@ -573,6 +752,7 @@ def build_dataset(csv_path: Path,
             parts = aligned_parts
 
         # Images
+        res = []
         if image_windows:
             for split_name, part_df in parts:
                 if part_df.empty:
@@ -589,104 +769,27 @@ def build_dataset(csv_path: Path,
                     end_ts = idx[-1]
                     y = int(part_df.loc[end_ts, f"y_h{h}"])
                     fname = ts_to_filename(end_ts)
-                    out_path = Path(out_path_batch) / split_name / f"h{h}" / f"y{y}" / f"{fname}_{symbol}.png" if out_path_batch else out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
+                    out_path = Path(out_path_batch) / split_name / f"correlation_test.csv"
+                    temp = {f"gk_tminus{i}":part_df.loc[idx[-i], 'vol'] for i in range(1,image_windows[0]+1)}
+                    temp['y']=y
+                    temp['median']=part_df.loc[end_ts,'median_hist']
+                    temp["symbol"]=symbol
+                    temp['split']=split_name
+                    temp['vol_mean']=part_df['vol'].mean()
+                    temp['vol_std']=part_df['vol'].std()
+                    temp['vol_max']=part_df['vol'].max()
+                    temp['vol_min']=part_df['vol'].min()
+                    res.append(temp)
+            res = pd.DataFrame(res).reset_index(drop=True)
+            res = res.loc[:, ~res.columns.str.contains('^Unnamed')]
 
-                    if image_encoder == "heatmap":
-                        # features simples pour heatmap
-                        win_df = part_df.loc[idx, ["vol","median_hist"]]
-                        to_heatmap_image(win_df.T, out_path,
-                                        cmap=heatmap_cmap,
-                                        vmin=heatmap_vmin, vmax=heatmap_vmax)
-
-                    elif image_encoder == "ts_vol":
-                        win_df = pd.DataFrame(index=idx)
-                        win_df["vol"] = vol_src.reindex(idx)
-                        if "volume" in ohlcv.columns:
-                            win_df["volume"] = ohlcv["volume"].reindex(idx)
-                        if win_df["vol"].isna().any():
-                            continue
-
-                        # slice precomputed indicators for this exact window
-                        win_ind = ind.loc[idx]
-                        to_timeseries_image(
-                            win_df, out_path, kind="vol", vol_col="vol",
-                            ma_window=ts_ma_window,
-                            # overlays (toggles de ta YAML)
-                            show_ma_top=show_ma_top,
-                            show_bbands=bb_enabled,
-                            bb_window=bb_window, bb_nstd=bb_nstd,
-                            bottom_panel=bottom_panel, rsi_window=rsi_window,
-                            #day sep
-                            show_day_separators=day_sep_enabled,
-                            day_sep_label=day_sep_label,
-                            day_sep_color=day_sep_color,
-                            day_sep_alpha=day_sep_alpha,
-                            day_sep_lw=day_sep_lw,
-                            day_label_kind=day_label_kind,
-                            # --- provide precomputed series ---
-                            ma_series=win_ind["vol_ma"],
-                            bb_up_series=win_ind["bb_up"],
-                            bb_lo_series=win_ind["bb_lo"],
-                            rsi_series=win_ind["rsi"] if bottom_panel == "rsi" else None,
-                            # style/size
-                            fg=fg, bg=bg, width_px=img_w, height_px=img_h, dpi=img_dpi
-                        )
-
-                    elif image_encoder == "ts_ohlc":
-                        needed = ["open","high","low","close"]
-                        if not set(needed).issubset(ohlcv.columns):
-                            continue  # pas d'OHLC -> skip
-                        win_df = ohlcv.reindex(idx)
-                        if win_df[needed].isna().any().any():
-                            continue
-                        to_timeseries_image(win_df, out_path, kind="ohlc",
-                                            ma_window=ts_ma_window,
-                            width_px=img_w, height_px=img_h, dpi=img_dpi)
-                    
-                    elif image_encoder == "recurrence":
-                        # choose the series to plot
-                        if rp_series == "vol":
-                            s = vol_src.reindex(idx)
-                        elif rp_series == "close":
-                            s = ohlcv["close"].reindex(idx) if "close" in ohlcv.columns else None
-                        else:
-                            # try from part_df first (e.g., "median_hist"), then from ohlcv
-                            s = part_df[rp_series].reindex(idx) if rp_series in part_df.columns else (
-                                ohlcv[rp_series].reindex(idx) if rp_series in ohlcv.columns else None
-                            )
-                        if s is None or s.isna().any():
-                            continue
-
-                        fname = ts_to_filename(end_ts)
-                        out_path = Path(out_path_batch) / split_name / f"h{h}" / f"y{y}" / f"{fname}.png" if out_path_batch else out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
-
-                        to_recurrence_image(
-                            s, out_path,
-                            normalize=rp_normalize,
-                            metric=rp_metric,
-                            epsilon_mode=rp_epsilon_mode,
-                            epsilon_q=rp_epsilon_q,
-                            epsilon_value=rp_epsilon_value,
-                            binarize=rp_binarize,
-                            cmap=rp_cmap,
-                            invert=rp_invert
-                        )
-                    
-                    elif image_encoder == "gaf":
-                        # choose the 1D series to encode (default: volatility)
-                        s = vol_src.reindex(idx)
-                        if s.isna().any():
-                            continue
-                        fname = ts_to_filename(end_ts)
-                        out_path = Path(out_path_batch) / split_name / f"h{h}" / f"y{y}" / f"{fname}.png" if out_path_batch else out_dir / symbol / split_name / f"h{h}" / f"y{y}" / f"{fname}.png"
-                        to_gaf_image(
-                            s, out_path,
-                            mode=gaf_mode,
-                            normalize=gaf_normalize,
-                            cmap=gaf_cmap,
-                            invert=gaf_invert
-                        )
-
+            try:
+                current = pd.read_csv(out_path)
+                current = current.loc[:, ~current.columns.str.contains('^Unnamed')]
+                current = pd.concat([current, res], ignore_index=True)
+                current.to_csv(out_path, index=False)
+            except FileNotFoundError:
+                res.to_csv(out_path, index=False)
         else:
             # If no images, we save a CSV of labels per split
             for split_name, part_df in parts:
@@ -727,6 +830,8 @@ def parse_args():
                help="Time-of-day bucket granularity for de-seasonalization.")
     p.add_argument("--time_col", type=str, default=None,
                help="Name of the timestamp column in the CSV.")
+    p.add_argument("--csv_dir", required=True, help="Folder containing per-symbol CSV files.")
+    p.add_argument("--pattern", default="*.csv", help="Glob pattern (default: *.csv).")
     return p.parse_args()
 
 
@@ -735,54 +840,59 @@ if __name__ == "__main__":
     m = merge_args_with_config(args)
     clean_scope = getattr(m, "clean_scope", "symbol")   # par défaut on nettoie le symbole courant
     do_clean    = getattr(m, "clean", True)             # active/désactive via YAML/CLI
-
+    csv_dir = Path(args.csv_dir).resolve()
+    files = sorted(csv_dir.glob(args.pattern))
     if do_clean and clean_scope:
         n = indicators.clean_dataset_dir(Path(m.out), symbol=m.symbol, what=clean_scope)
         print(f"[CLEAN] Removed {n} item(s) under '{clean_scope}' before generation.")
     splits = None
     if m.train_end:
         splits = (m.train_end, m.val_end)
-    build_dataset(csv_path=Path(m.csv),
-                out_dir=Path(m.out),
-                symbol=m.symbol,
-                horizon_list=m.horizons,
-                median_window=m.median_window,
-                image_windows=m.image_windows,
-                image_step=m.image_step,
-                splits=(m.train_end, m.val_end) if m.train_end else None,
-                deseason_mode=m.deseason_mode,
-                deseason_bucket=m.deseason_bucket,
-                image_encoder=m.image_encoder,
-                ts_ma_window=m.ts_ma_window,
-                img_w=m.img_w, img_h=m.img_h, img_dpi=m.img_dpi,
-                label_mode=m.label_mode,
-                rs_rule=m.rs_rule, rs_label=m.rs_label, rs_closed=m.rs_closed, rs_dropna=m.rs_dropna,
-                align_enabled=m.align_enabled,
-                align_time_str=m.align_time_str,
-                align_tz=m.align_tz,
-                heatmap_cmap=m.heatmap_cmap,
-                heatmap_vmin=m.heatmap_vmin,
-                heatmap_vmax=m.heatmap_vmax,
-                day_sep_enabled=m.day_sep_enabled,
-                day_sep_label=m.day_sep_label,
-                day_sep_color=m.day_sep_color,
-                day_sep_alpha=m.day_sep_alpha,
-                day_sep_lw=m.day_sep_lw,
-                day_label_kind=m.day_label_kind,
-                show_ma_top=m.show_ma_top, bb_enabled=m.bb_enabled, bb_window=m.bb_window, bb_nstd=m.bb_nstd,
-                bottom_panel=m.bottom_panel, rsi_window=m.rsi_window, rsi_source=m.rsi_source,
-                fg=m.fg, bg=m.bg,     
-                rp_series=m.rp_series,
-                rp_normalize=m.rp_normalize,
-                rp_metric=m.rp_metric,
-                rp_epsilon_mode=m.rp_epsilon_mode,
-                rp_epsilon_q=m.rp_epsilon_q,
-                rp_epsilon_value=m.rp_epsilon_value,
-                rp_binarize=m.rp_binarize,
-                rp_cmap=m.rp_cmap,
-                rp_invert=m.rp_invert,
-                gaf_mode=m.gaf_mode,
-                gaf_normalize=m.gaf_normalize,
-                gaf_cmap=m.gaf_cmap,
-                gaf_invert=m.gaf_invert,
-            )
+    for csv_path in files:
+        symbol = csv_path.stem  # ex: AAPL pour AAPL.csv
+        print(f"[RUN] sym={symbol} csv={csv_path}")
+        build_dataset(csv_path=csv_path,
+                    out_dir=Path(m.out),
+                    symbol=symbol,
+                    horizon_list=m.horizons,
+                    median_window=m.median_window,
+                    image_windows=m.image_windows,
+                    image_step=m.image_step,
+                    splits=(m.train_end, m.val_end) if m.train_end else None,
+                    deseason_mode=m.deseason_mode,
+                    deseason_bucket=m.deseason_bucket,
+                    image_encoder=m.image_encoder,
+                    ts_ma_window=m.ts_ma_window,
+                    img_w=m.img_w, img_h=m.img_h, img_dpi=m.img_dpi,
+                    label_mode=m.label_mode,
+                    rs_rule=m.rs_rule, rs_label=m.rs_label, rs_closed=m.rs_closed, rs_dropna=m.rs_dropna,
+                    align_enabled=m.align_enabled,
+                    align_time_str=m.align_time_str,
+                    align_tz=m.align_tz,
+                    heatmap_cmap=m.heatmap_cmap,
+                    heatmap_vmin=m.heatmap_vmin,
+                    heatmap_vmax=m.heatmap_vmax,
+                    day_sep_enabled=m.day_sep_enabled,
+                    day_sep_label=m.day_sep_label,
+                    day_sep_color=m.day_sep_color,
+                    day_sep_alpha=m.day_sep_alpha,
+                    day_sep_lw=m.day_sep_lw,
+                    day_label_kind=m.day_label_kind,
+                    show_ma_top=m.show_ma_top, bb_enabled=m.bb_enabled, bb_window=m.bb_window, bb_nstd=m.bb_nstd,
+                    bottom_panel=m.bottom_panel, rsi_window=m.rsi_window, rsi_source=m.rsi_source,
+                    fg=m.fg, bg=m.bg,     
+                    rp_series=m.rp_series,
+                    rp_normalize=m.rp_normalize,
+                    rp_metric=m.rp_metric,
+                    rp_epsilon_mode=m.rp_epsilon_mode,
+                    rp_epsilon_q=m.rp_epsilon_q,
+                    rp_epsilon_value=m.rp_epsilon_value,
+                    rp_binarize=m.rp_binarize,
+                    rp_cmap=m.rp_cmap,
+                    rp_invert=m.rp_invert,
+                    gaf_mode=m.gaf_mode,
+                    gaf_normalize=m.gaf_normalize,
+                    gaf_cmap=m.gaf_cmap,
+                    gaf_invert=m.gaf_invert,
+                    out_path_batch=m.batch_out
+                )

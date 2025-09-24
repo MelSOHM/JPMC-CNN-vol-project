@@ -119,7 +119,8 @@ def compute_global_indicators(
     else:
         src = vol
     ind["rsi"] = rsi_wilder(src, window=rsi_window)
-
+    mid, up, lo = bollinger_bands(src, window=bb_window, nstd=bb_nstd, min_periods=1)
+    ind["bb_mid"], ind["bb_up"], ind["bb_lo"] = mid, up, lo
     return ind
 
 def to_timeseries_image(

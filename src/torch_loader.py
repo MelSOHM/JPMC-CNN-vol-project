@@ -196,27 +196,20 @@ class ImageOnlyDataset(Dataset):
 # Transforms & weights
 # ---------------------------
 
-def build_transforms(img_size: Tuple[int, int],
-                     normalize: Optional[str] = "imagenet",
-                     train_augment: bool = False) -> Tuple[object, object]:
-    """Build (train_tfms, eval_tfms). Avoid flips/rotations (time axis)."""
-    if normalize == "imagenet":
-        mean = (0.485, 0.456, 0.406); std = (0.229, 0.224, 0.225)
+def build_transforms(img_size, normalize="imagenet", train_augment=False, channels=3):
+    if normalize == "imagenet" and channels == 3:
+        mean, std = (0.485,0.456,0.406), (0.229,0.224,0.225)
     elif normalize is None:
-        mean = (0.5, 0.5, 0.5); std = (0.5, 0.5, 0.5)
+        mean = (0.5,)*channels; std = (0.5,)*channels
     else:
-        raise ValueError("training.normalize must be 'imagenet' or null")
+        raise ValueError("Use normalize='imagenet' only with channels=3 or set to null.")
 
-    eval_tfms = T.Compose([T.Resize(img_size), T.ToTensor(), T.Normalize(mean, std)])
-    if train_augment:
-        train_tfms = T.Compose([
-            T.Resize(img_size),
-            T.ColorJitter(brightness=0.1, contrast=0.1),
-            T.RandomAffine(degrees=0, translate=(0.02, 0.0)),  # small horizontal shift
-            T.ToTensor(), T.Normalize(mean, std)
-        ])
-    else:
-        train_tfms = eval_tfms
+    common = [T.Resize(img_size)]
+    if channels == 1:
+        common.append(T.Grayscale(num_output_channels=1))
+    eval_tfms  = T.Compose(common + [T.ToTensor(), T.Normalize(mean, std)])
+    train_list = common + ([T.ColorJitter(0.1,0.1), T.RandomAffine(degrees=0, translate=(0.02,0.0))] if train_augment else [])
+    train_tfms = T.Compose(train_list + [T.ToTensor(), T.Normalize(mean, std)])
     return train_tfms, eval_tfms
 
 def compute_class_weights(samples: Sequence[ImgSample]) -> Tuple[torch.Tensor, int]:
@@ -269,8 +262,11 @@ def make_dataloaders_from_yaml(cfg_path: Union[str, Path]) -> Dict[str, DataLoad
 
     # horizons filter (optional)
     horizons = _get(cfg, "labels.horizons", None)
+    horizons = [0] if _get(cfg, "labels.mode") == 'in_sample' else horizons
     if horizons is not None:
         horizons = [int(h) for h in horizons]
+        
+    channels   = int(_get(cfg, "training.channels", 3))
 
     # training params
     bs          = int(_get(cfg, "training.batch_size", 64))
@@ -316,7 +312,7 @@ def make_dataloaders_from_yaml(cfg_path: Union[str, Path]) -> Dict[str, DataLoad
             print(f"[DS] {split:<5} n=0")
 
     # build transforms
-    train_tfms, eval_tfms = build_transforms(img_size, normalize=normalize, train_augment=augment)
+    train_tfms, eval_tfms = build_transforms(img_size, normalize=normalize, train_augment=augment, channels=channels)
 
     # datasets
     loaders: Dict[str, DataLoader] = {}
@@ -324,8 +320,11 @@ def make_dataloaders_from_yaml(cfg_path: Union[str, Path]) -> Dict[str, DataLoad
         samples = by_split[split]
         if not samples:
             continue
-        ds = ImageOnlyDataset(samples, transform=(train_tfms if split=="train" else eval_tfms),
-                              return_meta=return_meta, force_rgb=True)
+        ds = ImageOnlyDataset(samples,
+            transform=(train_tfms if split=="train" else eval_tfms),
+            return_meta=return_meta,
+            force_rgb=(channels==3)
+        )
 
         if split == "train" and balanced:
             w, offset = compute_class_weights(samples)
